@@ -13,6 +13,7 @@ The model uses variational inference with Bayes by Backprop:
 ## Files
 
 - `bnn_mnist.py`: training and evaluation script
+- `bnn_regression.py`: Bayes-by-Backprop regression on disjoint observation intervals
 - `draw_digit_app.py`: Tkinter app to draw a digit and classify it with the trained BNN
 - `requirements.txt`: minimal dependencies
 
@@ -63,3 +64,53 @@ In the app:
 - the drawing app needs a saved checkpoint before it can make predictions.
 - `num-workers` defaults to `0`, which is usually the safest choice on Windows.
 - This is a clear teaching implementation, not an optimized research codebase.
+
+## Regression Example
+
+`bnn_regression.py` trains a Bayesian regressor on synthetic observations that are only available inside several disjoint intervals. It then evaluates the predictive distribution across the full domain and reports uncertainty inside both observed and missing regions.
+
+The regression model:
+
+- samples training inputs only from configurable disjoint intervals
+- uses Bayes by Backprop with a diagonal Gaussian posterior
+- predicts a Gaussian mean and scale for each input
+- reports Monte Carlo uncertainty summaries over the full domain
+- supports a `normal` prior by default and an optional spike-and-slab prior
+
+Example with the default normal prior:
+
+```bash
+python bnn_regression.py --epochs 500 --plot-path checkpoints/bnn_regression.png
+```
+
+Example with custom intervals:
+
+```bash
+python bnn_regression.py --epochs 500 --observed-intervals=-4:-2.5,-0.4:0.5,2.0:3.2 --plot-path checkpoints/bnn_regression_custom.png
+```
+
+Example with the spike-and-slab prior:
+
+```bash
+python bnn_regression.py --epochs 500 --prior spike-slab --prior-pi 0.5 --prior-sigma1 1.0 --prior-sigma2 0.1 --plot-path checkpoints/bnn_regression_spike_slab.png
+```
+
+Useful regression options:
+
+- `--hidden-dims 64,64`
+- `--activation tanh`
+- `--train-points 192`
+- `--train-samples 3`
+- `--test-samples 200`
+- `--domain-min -5.0 --domain-max 4.5`
+- `--observed-intervals=-4:-2,-0.5:0.75,1.75:3.5`
+- `--prior normal`
+- `--prior spike-slab`
+- `--save-path checkpoints/bnn_regression.pt`
+
+When `--plot-path` is provided, the saved figure contains:
+
+- black `x` markers for the observed training points
+- a red median predictive curve
+- a blue interquartile band from the predictive distribution
+- shaded green regions showing where training observations were available
