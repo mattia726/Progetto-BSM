@@ -97,40 +97,37 @@ python bnn_regression.py --epochs 500 --prior spike-slab --prior-pi 0.5 --prior-
 
 Useful regression options:
 
-- `--hidden-dims 64,64`
-- `--activation tanh`
+- `--hidden-dims 256,256,256`
+- `--activation relu`
 - `--train-points 192`
 - `--train-samples 3`
 - `--validation-samples 64`
-- `--test-samples 200`
+- `--test-samples 400`
 - `--validation-fraction 0.2`
-- `--early-stopping-metric mse`
-- `--early-stopping-patience 50`
+- `--early-stopping-patience 80`
 - `--early-stopping-min-delta 0.0`
-- `--early-stopping-start-epoch 1`
-- `--kl-warmup-epochs 200`
 - `--domain-min -5.0 --domain-max 4.5`
 - `--observed-intervals=-4:-2,-0.5:0.75,1.75:3.5`
 - `--prior normal`
 - `--prior spike-slab`
-- `--save-path checkpoints/bnn_regression.pt`
+- `--save-path checkpoints/bnn_regression_best.pt`
 
 When `--plot-path` is provided, the saved figure contains:
 
 - black `x` markers for the observed training points
+- a dashed gray reference curve for the synthetic target function
 - a red median predictive curve
-- a blue interquartile band from sampled latent functions by default
+- a light-blue 95% interval
+- a darker blue interquartile band
 
 Optional plotting flags:
 
 - `--plot-quantiles observation` uses quantiles of noisy sampled observations and is the default
 - `--plot-quantiles function` uses quantiles of sampled latent functions
-- `--show-reference` overlays the true synthetic function
 - `--shade-observed-intervals` highlights the intervals that contain observations
 
 Training note:
 
-- `--kl-warmup-epochs` linearly ramps the KL term from `0` to `1` during early training, which can improve the regression fit before the Bayesian regularization fully turns on
-- early stopping uses validation MSE of the Monte Carlo mean prediction as the primary selection metric, with validation predictive NLL logged as a secondary uncertainty diagnostic
-- `--early-stopping-metric predictive_nll` switches early stopping to validation predictive NLL if you want to favor calibrated uncertainty over mean-fit accuracy
-- `--early-stopping-start-epoch` delays best-checkpoint tracking and patience counting until a later epoch, which is useful when the first part of training is dominated by KL warmup
+- early stopping uses validation predictive NLL
+- the KL term is always included as `kl / dataset_size` during training
+- after training, the script restores the best validation checkpoint and saves it to `checkpoints/bnn_regression_best.pt` by default so it can be reused for inference or plotting
