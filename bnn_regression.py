@@ -122,17 +122,26 @@ def complement_intervals(intervals: Sequence[Interval], domain_min: float, domai
 
 
 def paper_regression_function(x: torch.Tensor, noise_std: float) -> torch.Tensor:
-    """Target function inspired by the Bayes by Backprop regression example."""
+    """Oscillatory regression target with several frequencies and no dominant linear trend."""
 
     epsilon = noise_std * torch.randn_like(x)
     shifted_x = x + epsilon
-    return x + 0.3 * torch.sin(2.0 * math.pi * shifted_x) + 0.3 * torch.sin(4.0 * math.pi * shifted_x) + epsilon
+    return (
+        1.10 * torch.sin(1.35 * shifted_x)
+        + 0.45 * torch.sin(3.80 * shifted_x + 0.35)
+        + 0.20 * torch.cos(6.20 * shifted_x - 0.60)
+        + epsilon
+    )
 
 
 def paper_regression_mean(x: torch.Tensor) -> torch.Tensor:
     """Noise-free reference curve for plotting."""
 
-    return x + 0.3 * torch.sin(2.0 * math.pi * x) + 0.3 * torch.sin(4.0 * math.pi * x)
+    return (
+        1.10 * torch.sin(1.35 * x)
+        + 0.45 * torch.sin(3.80 * x + 0.35)
+        + 0.20 * torch.cos(6.20 * x - 0.60)
+    )
 
 
 def sample_inputs_from_intervals(intervals: Sequence[Interval], num_points: int) -> torch.Tensor:
@@ -166,6 +175,33 @@ def build_regression_dataset(
     inputs = sample_inputs_from_intervals(intervals, num_points=num_points)
     targets = paper_regression_function(inputs, noise_std=noise_std)
     return TensorDataset(inputs, targets)
+
+
+def split_tensor_dataset(
+    dataset: TensorDataset,
+    validation_fraction: float,
+    seed: int,
+) -> Tuple[TensorDataset, TensorDataset]:
+    """Split a TensorDataset into train and validation subsets."""
+
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("The validation fraction must be in the open interval (0, 1).")
+
+    inputs, targets = dataset.tensors
+    dataset_size = inputs.size(0)
+    validation_size = max(1, int(round(dataset_size * validation_fraction)))
+
+    if validation_size >= dataset_size:
+        raise ValueError("The validation split leaves no training examples. Reduce the validation fraction.")
+
+    generator = torch.Generator().manual_seed(seed)
+    permutation = torch.randperm(dataset_size, generator=generator)
+    validation_indices = permutation[:validation_size]
+    train_indices = permutation[validation_size:]
+
+    train_dataset = TensorDataset(inputs[train_indices], targets[train_indices])
+    validation_dataset = TensorDataset(inputs[validation_indices], targets[validation_indices])
+    return train_dataset, validation_dataset
 
 
 class RegressionStandardizer:
@@ -375,6 +411,14 @@ def gaussian_nll(mean: torch.Tensor, predictive_std: torch.Tensor, target: torch
     return 0.5 * (((target - mean) ** 2) / variance + torch.log(2.0 * math.pi * variance))
 
 
+def compute_kl_weight(epoch: int, warmup_epochs: int) -> float:
+    """Linearly anneal the KL term during the first warmup epochs."""
+
+    if warmup_epochs <= 0:
+        return 1.0
+    return min(1.0, epoch / warmup_epochs)
+
+
 def run_epoch(
     model: BayesianRegressor,
     loader: DataLoader,
@@ -382,6 +426,7 @@ def run_epoch(
     dataset_size: int,
     scaler: RegressionStandardizer,
     num_samples: int,
+    kl_weight: float = 1.0,
     optimizer: torch.optim.Optimizer | None = None,
 ) -> Dict[str, float]:
     """Run one train or evaluation epoch."""
@@ -409,7 +454,7 @@ def run_epoch(
             for _ in range(num_samples):
                 mean, predictive_std, kl = model(inputs, sample=True)
                 nll = gaussian_nll(mean, predictive_std, targets).mean()
-                scaled_kl = kl / dataset_size
+                scaled_kl = kl_weight * kl / dataset_size
                 loss = nll + scaled_kl
 
                 sample_losses.append(loss)
@@ -452,6 +497,61 @@ def run_epoch(
 
 
 @torch.no_grad()
+def evaluate_regression(
+    model: BayesianRegressor,
+    loader: DataLoader,
+    device: torch.device,
+    scaler: RegressionStandardizer,
+    num_samples: int,
+) -> Dict[str, float]:
+    """Evaluate Bayesian predictive metrics on a validation split."""
+
+    model.eval()
+    totals = {"predictive_nll": 0.0, "mse": 0.0, "predictive_std": 0.0, "examples": 0.0}
+
+    for inputs, targets in loader:
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+        batch_size = inputs.size(0)
+
+        sample_means = []
+        sample_stds = []
+        sample_log_probs = []
+
+        for _ in range(num_samples):
+            mean, predictive_std, _ = model(inputs, sample=True)
+            sample_means.append(mean)
+            sample_stds.append(predictive_std)
+            sample_log_probs.append(-gaussian_nll(mean, predictive_std, targets))
+
+        stacked_means = torch.stack(sample_means)
+        stacked_stds = torch.stack(sample_stds)
+        stacked_log_probs = torch.stack(sample_log_probs)
+
+        predictive_log_prob = torch.logsumexp(stacked_log_probs, dim=0) - math.log(num_samples)
+        predictive_nll = -predictive_log_prob.mean()
+
+        predictive_mean = stacked_means.mean(dim=0)
+        predictive_variance = stacked_stds.pow(2).mean(dim=0) + stacked_means.var(dim=0, unbiased=False)
+        original_predictive_mean = scaler.inverse_targets(predictive_mean.detach().cpu()).to(device)
+        original_targets = scaler.inverse_targets(targets.detach().cpu()).to(device)
+        mse = F.mse_loss(original_predictive_mean, original_targets)
+        mean_predictive_std = scaler.scale_target_std(predictive_variance.sqrt().detach().cpu()).mean().to(device)
+
+        totals["predictive_nll"] += predictive_nll.item() * batch_size
+        totals["mse"] += mse.item() * batch_size
+        totals["predictive_std"] += mean_predictive_std.item() * batch_size
+        totals["examples"] += batch_size
+
+    total_examples = totals["examples"]
+    return {
+        "predictive_nll": totals["predictive_nll"] / total_examples,
+        "mse": totals["mse"] / total_examples,
+        "predictive_std": totals["predictive_std"] / total_examples,
+    }
+
+
+@torch.no_grad()
 def predict_distribution(
     model: BayesianRegressor,
     inputs: torch.Tensor,
@@ -466,13 +566,18 @@ def predict_distribution(
 
     means = []
     predictive_stds = []
+    predictive_samples = []
     for _ in range(num_samples):
         sampled_mean, sampled_std, _ = model(inputs, sample=True)
         means.append(sampled_mean.squeeze(-1))
         predictive_stds.append(sampled_std.squeeze(-1))
+        predictive_samples.append((sampled_mean + sampled_std * torch.randn_like(sampled_mean)).squeeze(-1))
 
     stacked_means = torch.stack(means, dim=0)
     stacked_stds = torch.stack(predictive_stds, dim=0)
+    stacked_predictive_samples = torch.stack(predictive_samples, dim=0)
+    function_samples_original = scaler.inverse_targets(stacked_means.T.cpu()).T
+    predictive_samples_original = scaler.inverse_targets(stacked_predictive_samples.T.cpu()).T
     mean = scaler.inverse_targets(stacked_means.mean(dim=0, keepdim=True).T.cpu()).squeeze(-1).squeeze(-1)
     epistemic_std = scaler.scale_target_std(
         stacked_means.std(dim=0, unbiased=False, keepdim=True).T.cpu()
@@ -481,15 +586,22 @@ def predict_distribution(
         torch.sqrt(stacked_stds.pow(2).mean(dim=0, keepdim=True)).T.cpu()
     ).squeeze(-1).squeeze(-1)
     predictive_std = torch.sqrt(epistemic_std.pow(2) + aleatoric_std.pow(2))
-    iqr_scale = 0.67448975
 
     return {
         "means": stacked_means,
         "predictive_stds": stacked_stds,
+        "function_samples": function_samples_original,
+        "predictive_samples": predictive_samples_original,
         "mean": mean,
-        "median": mean,
-        "q25": mean - iqr_scale * predictive_std,
-        "q75": mean + iqr_scale * predictive_std,
+        "function_median": torch.quantile(function_samples_original, q=0.5, dim=0),
+        "function_q25": torch.quantile(function_samples_original, q=0.25, dim=0),
+        "function_q75": torch.quantile(function_samples_original, q=0.75, dim=0),
+        "observation_median": torch.quantile(predictive_samples_original, q=0.5, dim=0),
+        "observation_q25": torch.quantile(predictive_samples_original, q=0.25, dim=0),
+        "observation_q75": torch.quantile(predictive_samples_original, q=0.75, dim=0),
+        "median": torch.quantile(function_samples_original, q=0.5, dim=0),
+        "q25": torch.quantile(function_samples_original, q=0.25, dim=0),
+        "q75": torch.quantile(function_samples_original, q=0.75, dim=0),
         "epistemic_std": epistemic_std,
         "aleatoric_std": aleatoric_std,
         "predictive_std": predictive_std,
@@ -564,6 +676,16 @@ def save_checkpoint(
     domain_max: float,
     min_predictive_std: float,
     noise_std: float,
+    kl_warmup_epochs: int,
+    validation_fraction: float,
+    validation_samples: int,
+    early_stopping_metric: str,
+    early_stopping_patience: int,
+    early_stopping_min_delta: float,
+    early_stopping_start_epoch: int,
+    best_epoch: int,
+    best_validation_mse: float,
+    best_validation_predictive_nll: float,
     scaler: RegressionStandardizer,
     prior_config: Dict[str, float | str],
 ) -> None:
@@ -578,6 +700,16 @@ def save_checkpoint(
         "domain_max": domain_max,
         "min_predictive_std": min_predictive_std,
         "noise_std": noise_std,
+        "kl_warmup_epochs": kl_warmup_epochs,
+        "validation_fraction": validation_fraction,
+        "validation_samples": validation_samples,
+        "early_stopping_metric": early_stopping_metric,
+        "early_stopping_patience": early_stopping_patience,
+        "early_stopping_min_delta": early_stopping_min_delta,
+        "early_stopping_start_epoch": early_stopping_start_epoch,
+        "best_epoch": best_epoch,
+        "best_validation_mse": best_validation_mse,
+        "best_validation_predictive_nll": best_validation_predictive_nll,
         **scaler.config(),
         **prior_config,
     }
@@ -593,6 +725,9 @@ def plot_predictions(
     grid_inputs: torch.Tensor,
     summary: Dict[str, torch.Tensor],
     observed_intervals: Sequence[Interval],
+    quantile_space: str = "function",
+    show_reference: bool = False,
+    shade_observed_intervals: bool = False,
 ) -> None:
     """Save a plot with observed data, predictive median, and interquartile range."""
 
@@ -600,27 +735,54 @@ def plot_predictions(
 
     plot_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if quantile_space == "function":
+        median_key = "function_median"
+        q25_key = "function_q25"
+        q75_key = "function_q75"
+    elif quantile_space == "observation":
+        median_key = "observation_median"
+        q25_key = "observation_q25"
+        q75_key = "observation_q75"
+    else:
+        raise ValueError(f"Unsupported quantile space '{quantile_space}'.")
+
     x_train = train_inputs.squeeze(-1).cpu().numpy()
     y_train = train_targets.squeeze(-1).cpu().numpy()
     x_grid = grid_inputs.squeeze(-1).cpu().numpy()
-    median = summary["median"].cpu().numpy()
-    q25 = summary["q25"].cpu().numpy()
-    q75 = summary["q75"].cpu().numpy()
-    reference = paper_regression_mean(grid_inputs).squeeze(-1).cpu().numpy()
+    median = summary[median_key].cpu().numpy()
+    q25 = summary[q25_key].cpu().numpy()
+    q75 = summary[q75_key].cpu().numpy()
+    band_width = q75 - q25
 
     figure, axis = plt.subplots(figsize=(10, 5))
 
-    for left, right in observed_intervals:
-        axis.axvspan(left, right, color="#d8f0d2", alpha=0.35, linewidth=0)
+    if shade_observed_intervals:
+        for left, right in observed_intervals:
+            axis.axvspan(left, right, color="#d8f0d2", alpha=0.35, linewidth=0)
 
     axis.scatter(x_train, y_train, color="black", marker="x", alpha=0.7, label="Observations")
-    axis.plot(x_grid, reference, color="#888888", linestyle="--", linewidth=1.5, label="Reference function")
+
+    if show_reference:
+        reference = paper_regression_mean(grid_inputs).squeeze(-1).cpu().numpy()
+        axis.plot(x_grid, reference, color="#888888", linestyle="--", linewidth=1.5, label="Reference function")
+
+    axis.fill_between(x_grid, q25, q75, color="#4f8dd6", alpha=0.32, label="Interquartile range", zorder=1)
+    axis.plot(x_grid, q25, color="#4f8dd6", linewidth=1.0, alpha=0.95, zorder=2)
+    axis.plot(x_grid, q75, color="#4f8dd6", linewidth=1.0, alpha=0.95, zorder=2)
     axis.plot(x_grid, median, color="#c0392b", linewidth=2.0, label="Median prediction")
-    axis.fill_between(x_grid, q25, q75, color="#4f8dd6", alpha=0.25, label="Interquartile range")
 
     axis.set_title("Bayesian Regression with Disjoint Observation Intervals")
     axis.set_xlabel("x")
     axis.set_ylabel("y")
+    axis.text(
+        0.02,
+        0.02,
+        f"Mean IQR: {band_width.mean():.3f}",
+        transform=axis.transAxes,
+        fontsize=10,
+        color="#355c8a",
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.75, "edgecolor": "#b8cce6"},
+    )
     axis.legend()
     axis.grid(alpha=0.2)
     figure.tight_layout()
@@ -651,9 +813,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--activation", choices=["tanh", "relu"], default="tanh", help="Hidden-layer activation.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate.")
     parser.add_argument("--train-samples", type=int, default=3, help="Weight samples per training batch.")
+    parser.add_argument(
+        "--validation-samples",
+        type=int,
+        default=64,
+        help="Weight samples used to estimate validation predictive NLL for early stopping.",
+    )
     parser.add_argument("--test-samples", type=int, default=200, help="Weight samples for predictive summaries.")
     parser.add_argument("--train-points", type=int, default=192, help="Number of training points sampled from observed intervals.")
+    parser.add_argument(
+        "--validation-fraction",
+        type=float,
+        default=0.2,
+        help="Fraction of observed samples held out for validation and early stopping.",
+    )
+    parser.add_argument(
+        "--early-stopping-metric",
+        choices=["mse", "predictive_nll"],
+        default="mse",
+        help="Validation metric used to choose the best checkpoint and trigger early stopping.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=50,
+        help="Stop when the chosen validation early-stopping metric has not improved for this many epochs.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=0.0,
+        help="Minimum validation MSE improvement required to reset early stopping patience.",
+    )
+    parser.add_argument(
+        "--early-stopping-start-epoch",
+        type=int,
+        default=1,
+        help="Start tracking best validation metrics and patience from this epoch onward.",
+    )
     parser.add_argument("--noise-std", type=float, default=0.02, help="Noise scale used to generate observations.")
+    parser.add_argument(
+        "--kl-warmup-epochs",
+        type=int,
+        default=200,
+        help="Linearly increase the KL weight from 0 to 1 over this many epochs. Use 0 to disable warmup.",
+    )
     parser.add_argument(
         "--min-predictive-std",
         type=float,
@@ -678,6 +882,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=100, help="How often to print training progress.")
     parser.add_argument("--save-path", type=Path, default=None, help="Optional checkpoint path.")
     parser.add_argument("--plot-path", type=Path, default=None, help="Optional path for a predictive uncertainty plot.")
+    parser.add_argument(
+        "--plot-quantiles",
+        choices=["function", "observation"],
+        default="observation",
+        help="Whether the plotted IQR should come from sampled latent functions or noisy observations.",
+    )
+    parser.add_argument(
+        "--show-reference",
+        action="store_true",
+        help="Overlay the true synthetic function on the regression plot.",
+    )
+    parser.add_argument(
+        "--shade-observed-intervals",
+        action="store_true",
+        help="Shade the input intervals that contain training observations.",
+    )
     return parser.parse_args()
 
 
@@ -688,6 +908,18 @@ def main() -> None:
 
     if args.min_predictive_std <= 0.0:
         raise ValueError("The minimum predictive standard deviation must be positive.")
+    if args.validation_fraction <= 0.0 or args.validation_fraction >= 1.0:
+        raise ValueError("The validation fraction must be in the open interval (0, 1).")
+    if args.validation_samples <= 0:
+        raise ValueError("The validation samples must be positive.")
+    if args.kl_warmup_epochs < 0:
+        raise ValueError("The KL warmup epochs must be non-negative.")
+    if args.early_stopping_patience <= 0:
+        raise ValueError("The early stopping patience must be positive.")
+    if args.early_stopping_min_delta < 0.0:
+        raise ValueError("The early stopping minimum delta must be non-negative.")
+    if args.early_stopping_start_epoch <= 0:
+        raise ValueError("The early stopping start epoch must be positive.")
     if args.epochs <= 0:
         raise ValueError("The number of epochs must be positive.")
     if args.batch_size <= 0:
@@ -706,10 +938,21 @@ def main() -> None:
         num_points=args.train_points,
         noise_std=args.noise_std,
     )
-    train_inputs, train_targets = raw_dataset.tensors
+    raw_train_dataset, raw_validation_dataset = split_tensor_dataset(
+        raw_dataset,
+        validation_fraction=args.validation_fraction,
+        seed=args.seed,
+    )
+    train_inputs, train_targets = raw_train_dataset.tensors
+    validation_inputs, validation_targets = raw_validation_dataset.tensors
     scaler = RegressionStandardizer.fit(train_inputs, train_targets)
-    dataset = TensorDataset(scaler.transform_inputs(train_inputs), scaler.transform_targets(train_targets))
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    train_dataset = TensorDataset(scaler.transform_inputs(train_inputs), scaler.transform_targets(train_targets))
+    validation_dataset = TensorDataset(
+        scaler.transform_inputs(validation_inputs),
+        scaler.transform_targets(validation_targets),
+    )
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    validation_loader = DataLoader(validation_dataset, batch_size=args.batch_size, shuffle=False)
 
     model = BayesianRegressor(
         hidden_dims=args.hidden_dims,
@@ -723,28 +966,97 @@ def main() -> None:
     print(f"Observed intervals: {intervals_to_string(args.observed_intervals)}")
     print(f"Missing intervals: {intervals_to_string(complement_intervals(args.observed_intervals, args.domain_min, args.domain_max))}")
     print(f"Prior: {prior.config()}")
+    print(f"KL warmup epochs: {args.kl_warmup_epochs}")
+    print(f"Train / validation points: {len(train_dataset)} / {len(validation_dataset)}")
+    if args.early_stopping_metric == "mse":
+        print("Early stopping metric: validation MSE of the Monte Carlo mean prediction")
+    else:
+        print("Early stopping metric: validation predictive NLL")
+    print(f"Early stopping starts at epoch: {args.early_stopping_start_epoch}")
+
+    best_validation_score = float("inf")
+    best_validation_mse = float("inf")
+    best_validation_predictive_nll = float("inf")
+    best_epoch = 0
+    best_state_dict = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+    epochs_without_improvement = 0
 
     for epoch in range(1, args.epochs + 1):
-        metrics = run_epoch(
+        kl_weight = compute_kl_weight(epoch=epoch, warmup_epochs=args.kl_warmup_epochs)
+        train_metrics = run_epoch(
             model=model,
-            loader=loader,
+            loader=train_loader,
             device=device,
-            dataset_size=len(dataset),
+            dataset_size=len(train_dataset),
             scaler=scaler,
             num_samples=args.train_samples,
+            kl_weight=kl_weight,
             optimizer=optimizer,
         )
+        validation_metrics = evaluate_regression(
+            model=model,
+            loader=validation_loader,
+            device=device,
+            scaler=scaler,
+            num_samples=args.validation_samples,
+        )
+
+        if epoch >= args.early_stopping_start_epoch:
+            current_validation_score = validation_metrics[args.early_stopping_metric]
+            improvement_threshold = best_validation_score - args.early_stopping_min_delta
+            if current_validation_score < improvement_threshold:
+                best_validation_score = current_validation_score
+                best_validation_mse = validation_metrics["mse"]
+                best_validation_predictive_nll = validation_metrics["predictive_nll"]
+                best_epoch = epoch
+                best_state_dict = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
 
         should_log = epoch == 1 or epoch == args.epochs or epoch % args.log_every == 0
         if should_log:
             print(
                 f"Epoch {epoch:04d} | "
-                f"loss {metrics['loss']:.4f} | "
-                f"nll {metrics['nll']:.4f} | "
-                f"kl {metrics['kl']:.4f} | "
-                f"mse {metrics['mse']:.4f} | "
-                f"pred std {metrics['predictive_std']:.4f}"
+                f"beta {kl_weight:.3f} | "
+                f"train loss {train_metrics['loss']:.4f} | "
+                f"train nll {train_metrics['nll']:.4f} | "
+                f"train mse {train_metrics['mse']:.4f} | "
+                f"val mse {validation_metrics['mse']:.4f} | "
+                f"val pred-nll {validation_metrics['predictive_nll']:.4f} | "
+                f"val pred std {validation_metrics['predictive_std']:.4f}"
             )
+
+        if epoch >= args.early_stopping_start_epoch and epochs_without_improvement >= args.early_stopping_patience:
+            best_metric_label = "val mse" if args.early_stopping_metric == "mse" else "val pred-nll"
+            best_metric_value = best_validation_mse if args.early_stopping_metric == "mse" else best_validation_predictive_nll
+            print(
+                f"Early stopping at epoch {epoch:04d} | "
+                f"best epoch {best_epoch:04d} | "
+                f"best {best_metric_label} {best_metric_value:.4f}"
+            )
+            break
+
+    if best_epoch == 0:
+        best_epoch = args.epochs
+        best_validation_score = validation_metrics[args.early_stopping_metric]
+        best_validation_mse = validation_metrics["mse"]
+        best_validation_predictive_nll = validation_metrics["predictive_nll"]
+        best_state_dict = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+
+    model.load_state_dict(best_state_dict)
+    final_validation_metrics = evaluate_regression(
+        model=model,
+        loader=validation_loader,
+        device=device,
+        scaler=scaler,
+        num_samples=args.validation_samples,
+    )
+    print(
+        f"Restored best model from epoch {best_epoch:04d} | "
+        f"val mse {final_validation_metrics['mse']:.4f} | "
+        f"val pred-nll {final_validation_metrics['predictive_nll']:.4f}"
+    )
 
     grid_inputs = torch.linspace(args.domain_min, args.domain_max, steps=args.grid_size, dtype=torch.float32).unsqueeze(1)
     scaled_grid_inputs = scaler.transform_inputs(grid_inputs)
@@ -778,6 +1090,16 @@ def main() -> None:
             domain_max=args.domain_max,
             min_predictive_std=args.min_predictive_std,
             noise_std=args.noise_std,
+            kl_warmup_epochs=args.kl_warmup_epochs,
+            validation_fraction=args.validation_fraction,
+            validation_samples=args.validation_samples,
+            early_stopping_metric=args.early_stopping_metric,
+            early_stopping_patience=args.early_stopping_patience,
+            early_stopping_min_delta=args.early_stopping_min_delta,
+            early_stopping_start_epoch=args.early_stopping_start_epoch,
+            best_epoch=best_epoch,
+            best_validation_mse=best_validation_mse,
+            best_validation_predictive_nll=best_validation_predictive_nll,
             scaler=scaler,
             prior_config=prior.config(),
         )
@@ -791,6 +1113,9 @@ def main() -> None:
             grid_inputs=grid_inputs,
             summary=prediction_summary,
             observed_intervals=args.observed_intervals,
+            quantile_space=args.plot_quantiles,
+            show_reference=args.show_reference,
+            shade_observed_intervals=args.shade_observed_intervals,
         )
         print(f"Saved predictive plot to {args.plot_path}")
 

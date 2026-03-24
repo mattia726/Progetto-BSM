@@ -67,7 +67,7 @@ In the app:
 
 ## Regression Example
 
-`bnn_regression.py` trains a Bayesian regressor on synthetic observations that are only available inside several disjoint intervals. It then evaluates the predictive distribution across the full domain and reports uncertainty inside both observed and missing regions.
+`bnn_regression.py` trains a Bayesian regressor on a synthetic oscillatory target where observations are only available inside several disjoint intervals. It then evaluates the predictive distribution across the full domain and reports uncertainty inside both observed and missing regions.
 
 The regression model:
 
@@ -101,7 +101,14 @@ Useful regression options:
 - `--activation tanh`
 - `--train-points 192`
 - `--train-samples 3`
+- `--validation-samples 64`
 - `--test-samples 200`
+- `--validation-fraction 0.2`
+- `--early-stopping-metric mse`
+- `--early-stopping-patience 50`
+- `--early-stopping-min-delta 0.0`
+- `--early-stopping-start-epoch 1`
+- `--kl-warmup-epochs 200`
 - `--domain-min -5.0 --domain-max 4.5`
 - `--observed-intervals=-4:-2,-0.5:0.75,1.75:3.5`
 - `--prior normal`
@@ -112,5 +119,18 @@ When `--plot-path` is provided, the saved figure contains:
 
 - black `x` markers for the observed training points
 - a red median predictive curve
-- a blue interquartile band from the predictive distribution
-- shaded green regions showing where training observations were available
+- a blue interquartile band from sampled latent functions by default
+
+Optional plotting flags:
+
+- `--plot-quantiles observation` uses quantiles of noisy sampled observations and is the default
+- `--plot-quantiles function` uses quantiles of sampled latent functions
+- `--show-reference` overlays the true synthetic function
+- `--shade-observed-intervals` highlights the intervals that contain observations
+
+Training note:
+
+- `--kl-warmup-epochs` linearly ramps the KL term from `0` to `1` during early training, which can improve the regression fit before the Bayesian regularization fully turns on
+- early stopping uses validation MSE of the Monte Carlo mean prediction as the primary selection metric, with validation predictive NLL logged as a secondary uncertainty diagnostic
+- `--early-stopping-metric predictive_nll` switches early stopping to validation predictive NLL if you want to favor calibrated uncertainty over mean-fit accuracy
+- `--early-stopping-start-epoch` delays best-checkpoint tracking and patience counting until a later epoch, which is useful when the first part of training is dominated by KL warmup
