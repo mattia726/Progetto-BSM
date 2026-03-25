@@ -11,7 +11,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from bnn_regression_data import RegressionStandardizer
+from .bnn_regression_data import RegressionStandardizer
 
 
 def gaussian_log_prob(value: torch.Tensor, mean: torch.Tensor | float, sigma: torch.Tensor) -> torch.Tensor:

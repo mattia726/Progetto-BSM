@@ -13,10 +13,11 @@ The model uses variational inference with Bayes by Backprop:
 ## Files
 
 - `bnn_mnist.py`: training and evaluation script
-- `bnn_regression.py`: CLI entrypoint for Bayes-by-Backprop regression on disjoint observation intervals
-- `bnn_regression_data.py`: interval handling, synthetic targets, dataset builders, and normalization helpers
-- `bnn_regression_model.py`: priors, Bayesian layers, spline/global sigma models, and training utilities
-- `bnn_regression_eval.py`: predictive evaluation, checkpointing, plotting, and checkpoint-only replotting
+- `bnn_regression.py`: compatibility launcher for the regression CLI
+- `regression/bnn_regression.py`: CLI entrypoint for Bayes-by-Backprop regression on disjoint observation intervals
+- `regression/bnn_regression_data.py`: interval handling, synthetic targets, dataset builders, and normalization helpers
+- `regression/bnn_regression_model.py`: priors, Bayesian layers, spline/global sigma models, and training utilities
+- `regression/bnn_regression_eval.py`: predictive evaluation, checkpointing, plotting, and checkpoint-only replotting
 - `draw_digit_app.py`: Tkinter app to draw a digit and classify it with the trained BNN
 - `requirements.txt`: minimal dependencies
 
@@ -84,67 +85,67 @@ The regression model:
 Example with the default normal prior:
 
 ```bash
-python bnn_regression.py --epochs 500 --plot-path checkpoints/bnn_regression.png
+python bnn_regression.py --epochs 500 --plot-path outputs/regression/plots/bnn_regression.png
 ```
 
 Example with custom intervals:
 
 ```bash
-python bnn_regression.py --epochs 500 --observed-intervals=-4:-2.5,-0.4:0.5,2.0:3.2 --plot-path checkpoints/bnn_regression_custom.png
+python bnn_regression.py --epochs 500 --observed-intervals=-4:-2.5,-0.4:0.5,2.0:3.2 --plot-path outputs/regression/plots/bnn_regression_custom.png
 ```
 
 Example with the paper regression target and a single observed interval:
 
 ```bash
-python bnn_regression.py --target-function paper --observed-intervals=0.0:0.5 --domain-min -0.2 --domain-max 1.2 --plot-path checkpoints/bnn_regression_paper.png
+python bnn_regression.py --target-function paper --observed-intervals=0.0:0.5 --domain-min -0.2 --domain-max 1.2 --plot-path outputs/regression/plots/bnn_regression_paper.png
 ```
 
 Example with the non-default paper preset:
 
 ```bash
-python bnn_regression.py --preset paper-figure5 --plot-path checkpoints/bnn_regression_paper_preset.png
+python bnn_regression.py --preset paper-figure5 --plot-path outputs/regression/plots/bnn_regression_paper_preset.png
 ```
 
 Example with the default single learned likelihood sigma shared across all inputs:
 
 ```bash
-python bnn_regression.py --preset paper-figure5 --plot-path checkpoints/bnn_regression_paper_global_sigma.png
+python bnn_regression.py --preset paper-figure5 --plot-path outputs/regression/plots/bnn_regression_paper_global_sigma.png
 ```
 
 Example with a natural cubic spline model for `log sigma(x)`:
 
 ```bash
-python bnn_regression.py --preset paper-figure5 --likelihood-std-model spline --spline-num-knots 5 --plot-path checkpoints/bnn_regression_paper_spline_sigma.png
+python bnn_regression.py --preset paper-figure5 --likelihood-std-model spline --spline-num-knots 5 --plot-path outputs/regression/plots/bnn_regression_paper_spline_sigma.png
 ```
 
 Example with a Gaussian radial-basis expansion for `log sigma(x)`:
 
 ```bash
-python bnn_regression.py --preset paper-figure5 --likelihood-std-model rbf --rbf-num-centers 5 --plot-path checkpoints/bnn_regression_paper_rbf_sigma.png
+python bnn_regression.py --preset paper-figure5 --likelihood-std-model rbf --rbf-num-centers 5 --plot-path outputs/regression/plots/bnn_regression_paper_rbf_sigma.png
 ```
 
 Example with a few guide observations outside the main intervals:
 
 ```bash
-python bnn_regression.py --target-function paper --domain-min -0.4 --domain-max 1.2 --observed-intervals=0.0:0.2,0.6:0.8 --guide-points-outside-intervals 6 --plot-path checkpoints/bnn_regression_paper_guided.png
+python bnn_regression.py --target-function paper --domain-min -0.4 --domain-max 1.2 --observed-intervals=0.0:0.2,0.6:0.8 --guide-points-outside-intervals 6 --plot-path outputs/regression/plots/bnn_regression_paper_guided.png
 ```
 
 Example with interval-specific observation noise inside the two observed intervals:
 
 ```bash
-python bnn_regression.py --likelihood-std-model spline --target-function paper --domain-min -0.4 --domain-max 1.2 --observed-intervals=0.0:0.2,0.6:0.8 --observed-interval-noise-stds 0.01,0.06 --guide-points-outside-intervals 10 --guide-region-mode outer-only --guide-points-interior-gaps 4 --plot-path checkpoints/bnn_regression_paper_interval_noise.png
+python bnn_regression.py --likelihood-std-model spline --target-function paper --domain-min -0.4 --domain-max 1.2 --observed-intervals=0.0:0.2,0.6:0.8 --observed-interval-noise-stds 0.01,0.06 --guide-points-outside-intervals 10 --guide-region-mode outer-only --guide-points-interior-gaps 4 --plot-path outputs/regression/plots/bnn_regression_paper_interval_noise.png
 ```
 
 Plot again from a saved checkpoint without retraining:
 
 ```bash
-python bnn_regression.py --plot-from-checkpoint checkpoints/bnn_regression_best.pt --plot-path checkpoints/bnn_regression_replot.png
+python bnn_regression.py --plot-from-checkpoint outputs/regression/weights/bnn_regression_best.pt --plot-path outputs/regression/plots/bnn_regression_replot.png
 ```
 
 Example with the spike-and-slab prior:
 
 ```bash
-python bnn_regression.py --epochs 500 --prior spike-slab --prior-pi 0.5 --prior-sigma1 1.0 --prior-sigma2 0.1 --plot-path checkpoints/bnn_regression_spike_slab.png
+python bnn_regression.py --epochs 500 --prior spike-slab --prior-pi 0.5 --prior-sigma1 1.0 --prior-sigma2 0.1 --plot-path outputs/regression/plots/bnn_regression_spike_slab.png
 ```
 
 Useful regression options:
@@ -187,8 +188,8 @@ Useful regression options:
 - `--coverage-eval-samples 1000`
 - `--prior normal`
 - `--prior spike-slab`
-- `--save-path checkpoints/bnn_regression_best.pt`
-- `--plot-from-checkpoint checkpoints/bnn_regression_best.pt`
+- `--save-path outputs/regression/weights/bnn_regression_best.pt`
+- `--plot-from-checkpoint outputs/regression/weights/bnn_regression_best.pt`
 
 When `--plot-path` is provided, the saved figure contains:
 
@@ -212,4 +213,4 @@ Training note:
 - the KL term is always included as `kl / dataset_size` during training
 - for `--likelihood-std-model spline`, `log sigma(x)` is modeled as an intercept plus a natural cubic spline basis on normalized inputs, and each spline coefficient has its own independent Gaussian prior penalty
 - for `--likelihood-std-model rbf`, `log sigma(x)` is modeled as an intercept plus Gaussian radial basis functions centered at equally spaced points; the RBF lengthscale is learned with a Gaussian prior on log-lengthscale, and each RBF coefficient has its own independent Gaussian prior penalty
-- after training, the script restores the best validation checkpoint and saves it to `checkpoints/bnn_regression_best.pt` by default so it can be reused for inference or plotting
+- after training, the script restores the best validation checkpoint and saves it to `outputs/regression/weights/bnn_regression_best.pt` by default so it can be reused for inference or plotting

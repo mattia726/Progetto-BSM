@@ -10,7 +10,7 @@ from typing import Dict, Sequence
 import torch
 from torch.utils.data import DataLoader
 
-from bnn_regression_data import (
+from .bnn_regression_data import (
     Interval,
     RegressionStandardizer,
     complement_intervals,
@@ -21,7 +21,7 @@ from bnn_regression_data import (
     sample_targets_with_interval_noise,
     to_original_target_std,
 )
-from bnn_regression_model import BayesianRegressor, build_prior_from_config, gaussian_nll
+from .bnn_regression_model import BayesianRegressor, build_prior_from_config, gaussian_nll
 
 
 @torch.no_grad()
