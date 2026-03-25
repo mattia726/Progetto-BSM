@@ -4,7 +4,7 @@ import argparse
 import math
 import random
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 Interval = Tuple[float, float]
 DEFAULT_OBSERVED_INTERVALS = [(-4.0, -2.0), (-0.5, 0.75), (1.75, 3.5)]
+PAPER_FIGURE5_INTERVALS = [(0.0, 0.5)]
 
 
 def set_seed(seed: int) -> None:
@@ -51,8 +52,8 @@ def parse_intervals(value: str) -> List[Interval]:
     """Parse intervals written as 'left:right,left:right'."""
 
     chunks = [chunk.strip() for chunk in value.split(",") if chunk.strip()]
-    if len(chunks) < 2:
-        raise argparse.ArgumentTypeError("Provide at least two disjoint intervals.")
+    if len(chunks) < 1:
+        raise argparse.ArgumentTypeError("Provide at least one interval.")
 
     intervals: List[Interval] = []
     for chunk in chunks:
@@ -121,7 +122,7 @@ def complement_intervals(intervals: Sequence[Interval], domain_min: float, domai
     return gaps
 
 
-def paper_regression_function(x: torch.Tensor, noise_std: float) -> torch.Tensor:
+def oscillatory_regression_function(x: torch.Tensor, noise_std: float) -> torch.Tensor:
     """Oscillatory regression target with several frequencies and no dominant linear trend."""
 
     epsilon = noise_std * torch.randn_like(x)
@@ -134,14 +135,56 @@ def paper_regression_function(x: torch.Tensor, noise_std: float) -> torch.Tensor
     )
 
 
-def paper_regression_mean(x: torch.Tensor) -> torch.Tensor:
-    """Noise-free reference curve for plotting."""
+def oscillatory_regression_mean(x: torch.Tensor) -> torch.Tensor:
+    """Noise-free reference curve for the oscillatory default target."""
 
     return (
         1.10 * torch.sin(1.35 * x)
         + 0.45 * torch.sin(3.80 * x + 0.35)
         + 0.20 * torch.cos(6.20 * x - 0.60)
     )
+
+
+def paper_regression_function(x: torch.Tensor, noise_std: float) -> torch.Tensor:
+    """Regression target from Figure 5 of Bayes by Backprop."""
+
+    epsilon = noise_std * torch.randn_like(x)
+    shifted_x = x + epsilon
+    return shifted_x + 0.3 * torch.sin(2.0 * math.pi * shifted_x) + 0.3 * torch.sin(4.0 * math.pi * shifted_x) + epsilon
+
+
+def paper_regression_mean(x: torch.Tensor) -> torch.Tensor:
+    """Noise-free reference curve for the paper regression target."""
+
+    return x + 0.3 * torch.sin(2.0 * math.pi * x) + 0.3 * torch.sin(4.0 * math.pi * x)
+
+
+def resolve_regression_target(
+    name: str,
+) -> Tuple[Callable[[torch.Tensor, float], torch.Tensor], Callable[[torch.Tensor], torch.Tensor]]:
+    """Return the noisy sampling function and deterministic mean for the requested target."""
+
+    if name == "oscillatory":
+        return oscillatory_regression_function, oscillatory_regression_mean
+    if name == "paper":
+        return paper_regression_function, paper_regression_mean
+    raise ValueError(f"Unsupported regression target '{name}'.")
+
+
+def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
+    """Override a subset of arguments with a named experimental preset."""
+
+    if args.preset is None:
+        return args
+
+    if args.preset == "paper-figure5":
+        args.target_function = "paper"
+        args.observed_intervals = list(PAPER_FIGURE5_INTERVALS)
+        args.domain_min = -0.4
+        args.domain_max = 1.2
+        return args
+
+    raise ValueError(f"Unsupported preset '{args.preset}'.")
 
 
 def sample_inputs_from_intervals(intervals: Sequence[Interval], num_points: int) -> torch.Tensor:
@@ -169,11 +212,73 @@ def build_regression_dataset(
     intervals: Sequence[Interval],
     num_points: int,
     noise_std: float,
+    target_fn: Callable[[torch.Tensor, float], torch.Tensor],
 ) -> TensorDataset:
     """Create a synthetic regression dataset restricted to observed intervals."""
 
     inputs = sample_inputs_from_intervals(intervals, num_points=num_points)
-    targets = paper_regression_function(inputs, noise_std=noise_std)
+    targets = target_fn(inputs, noise_std=noise_std)
+    return TensorDataset(inputs, targets)
+
+
+def build_outside_interval_guide_dataset(
+    observed_intervals: Sequence[Interval],
+    domain_min: float,
+    domain_max: float,
+    num_points: int,
+    region_mode: str,
+    noise_std: float,
+    target_fn: Callable[[torch.Tensor, float], torch.Tensor],
+) -> TensorDataset | None:
+    """Create a small guidance dataset from gaps outside the main observed intervals."""
+
+    if num_points <= 0:
+        return None
+
+    sorted_intervals = sorted(observed_intervals)
+    if region_mode == "all-gaps":
+        guide_intervals = complement_intervals(sorted_intervals, domain_min=domain_min, domain_max=domain_max)
+    elif region_mode == "outer-only":
+        guide_intervals: List[Interval] = []
+        leftmost_left = sorted_intervals[0][0]
+        rightmost_right = sorted_intervals[-1][1]
+        if domain_min < leftmost_left:
+            guide_intervals.append((domain_min, leftmost_left))
+        if rightmost_right < domain_max:
+            guide_intervals.append((rightmost_right, domain_max))
+    else:
+        raise ValueError(f"Unsupported guide region mode '{region_mode}'.")
+
+    if not guide_intervals:
+        return None
+
+    inputs = sample_inputs_from_intervals(guide_intervals, num_points=num_points)
+    targets = target_fn(inputs, noise_std=noise_std)
+    return TensorDataset(inputs, targets)
+
+
+def build_interior_gap_guide_dataset(
+    observed_intervals: Sequence[Interval],
+    num_points: int,
+    noise_std: float,
+    target_fn: Callable[[torch.Tensor, float], torch.Tensor],
+) -> TensorDataset | None:
+    """Create a small guidance dataset from the interior gaps between observed intervals."""
+
+    if num_points <= 0:
+        return None
+
+    sorted_intervals = sorted(observed_intervals)
+    interior_gaps = [
+        (sorted_intervals[index][1], sorted_intervals[index + 1][0])
+        for index in range(len(sorted_intervals) - 1)
+        if sorted_intervals[index][1] < sorted_intervals[index + 1][0]
+    ]
+    if not interior_gaps:
+        return None
+
+    inputs = sample_inputs_from_intervals(interior_gaps, num_points=num_points)
+    targets = target_fn(inputs, noise_std=noise_std)
     return TensorDataset(inputs, targets)
 
 
@@ -222,6 +327,15 @@ class RegressionStandardizer:
             target_std=targets.std(dim=0, keepdim=True, unbiased=False),
         )
 
+    @classmethod
+    def from_config(cls, config: Dict[str, float | str | torch.Tensor]) -> "RegressionStandardizer":
+        return cls(
+            input_mean=torch.tensor([[float(config["input_mean"])]]),
+            input_std=torch.tensor([[float(config["input_std"])]]),
+            target_mean=torch.tensor([[float(config["target_mean"])]]),
+            target_std=torch.tensor([[float(config["target_std"])]]),
+        )
+
     def transform_inputs(self, inputs: torch.Tensor) -> torch.Tensor:
         return (inputs - self.input_mean) / self.input_std
 
@@ -241,6 +355,69 @@ class RegressionStandardizer:
             "target_mean": float(self.target_mean.squeeze().item()),
             "target_std": float(self.target_std.squeeze().item()),
         }
+
+
+def to_original_target_std(normalized_std: float, scaler: RegressionStandardizer) -> float:
+    """Convert a standard deviation from normalized target space back to original target units."""
+
+    std_tensor = torch.tensor([[normalized_std]], dtype=torch.float32)
+    return float(scaler.scale_target_std(std_tensor).squeeze().item())
+
+
+def estimate_local_observation_std(inputs: torch.Tensor, targets: torch.Tensor) -> float:
+    """Estimate an observation scale from nearby target differences without using the generator noise."""
+
+    if inputs.size(0) < 2:
+        fallback = float(targets.std(unbiased=False).item())
+        return max(fallback * 0.1, 1e-4)
+
+    sort_indices = torch.argsort(inputs.squeeze(-1))
+    sorted_inputs = inputs[sort_indices].squeeze(-1)
+    sorted_targets = targets[sort_indices].squeeze(-1)
+    input_deltas = torch.diff(sorted_inputs)
+    target_deltas = torch.diff(sorted_targets)
+
+    valid = input_deltas > 0
+    input_deltas = input_deltas[valid]
+    target_deltas = target_deltas[valid]
+    if input_deltas.numel() == 0:
+        fallback = float(targets.std(unbiased=False).item())
+        return max(fallback * 0.1, 1e-4)
+
+    nearest_count = max(1, int(math.ceil(input_deltas.numel() * 0.25)))
+    nearest_indices = torch.argsort(input_deltas)[:nearest_count]
+    local_abs_deltas = target_deltas[nearest_indices].abs()
+    median_abs_delta = float(torch.median(local_abs_deltas).item())
+    gaussian_abs_median = 0.6744897501960817
+    estimated_std = median_abs_delta / (gaussian_abs_median * math.sqrt(2.0))
+
+    fallback = float(targets.std(unbiased=False).item()) * 0.1
+    return max(estimated_std, fallback, 1e-4)
+
+
+def resolve_global_likelihood_init_std(
+    train_inputs: torch.Tensor,
+    train_targets: torch.Tensor,
+    scaler: RegressionStandardizer,
+    min_predictive_std: float,
+    user_init_std_original_units: float | None,
+) -> Tuple[float, float, str]:
+    """Choose a global likelihood sigma init without leaking the generator noise to the model."""
+
+    if user_init_std_original_units is None:
+        init_std_original = estimate_local_observation_std(train_inputs, train_targets)
+        source = "data-driven"
+    else:
+        if user_init_std_original_units <= 0.0:
+            raise ValueError("The global likelihood initial standard deviation must be positive.")
+        init_std_original = float(user_init_std_original_units)
+        source = "user"
+
+    target_scale = float(scaler.target_std.squeeze().item())
+    normalized_floor = max(min_predictive_std / target_scale, 1e-6)
+    init_std_normalized = max(init_std_original / target_scale, normalized_floor)
+    init_std_original = init_std_normalized * target_scale
+    return init_std_normalized, init_std_original, source
 
 
 def gaussian_log_prob(value: torch.Tensor, mean: torch.Tensor | float, sigma: torch.Tensor) -> torch.Tensor:
@@ -360,14 +537,44 @@ class BayesianLinear(nn.Module):
         return F.linear(x, weight, bias), kl
 
 
+class GlobalLikelihoodSigma(nn.Module):
+    """Single learned likelihood standard deviation shared across all inputs."""
+
+    def __init__(self, init_std: float, prior_sigma: float) -> None:
+        super().__init__()
+
+        if init_std <= 0.0:
+            raise ValueError("The global likelihood initial standard deviation must be positive.")
+        if prior_sigma <= 0.0:
+            raise ValueError("The global likelihood prior sigma must be positive.")
+
+        self.log_std = nn.Parameter(torch.tensor(math.log(init_std), dtype=torch.float32))
+        self.prior_mean_log_std = math.log(init_std)
+        self.prior_sigma = prior_sigma
+
+    def forward(self, reference: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        log_std = self.log_std.to(device=reference.device, dtype=reference.dtype)
+        sigma = torch.exp(log_std).expand_as(reference)
+        prior_mean = reference.new_tensor(self.prior_mean_log_std)
+        prior_sigma = reference.new_tensor(self.prior_sigma)
+        prior_penalty = -gaussian_log_prob(log_std, prior_mean, prior_sigma)
+        return sigma, prior_penalty
+
+    def current_std(self) -> float:
+        return float(torch.exp(self.log_std.detach()).item())
+
+
 class BayesianRegressor(nn.Module):
-    """Small Bayesian MLP that predicts a Gaussian mean and scale."""
+    """Small Bayesian MLP that predicts a Gaussian mean and either local or global scale."""
 
     def __init__(
         self,
         hidden_dims: Sequence[int],
         prior: PriorDistribution,
         activation: str = "gelu",
+        likelihood_std_model: str = "heteroscedastic",
+        global_likelihood_init_std: float = 0.02,
+        global_likelihood_prior_sigma: float = 1.0,
         min_predictive_std: float = 1e-3,
     ) -> None:
         super().__init__()
@@ -376,11 +583,21 @@ class BayesianRegressor(nn.Module):
             raise ValueError("The minimum predictive standard deviation must be positive.")
 
         self.min_predictive_std = min_predictive_std
-        layer_sizes = [1, *hidden_dims, 2]
+        self.likelihood_std_model = likelihood_std_model
+        output_dim = 2 if likelihood_std_model == "heteroscedastic" else 1
+        layer_sizes = [1, *hidden_dims, output_dim]
         self.layers = nn.ModuleList(
             BayesianLinear(in_features, out_features, prior=prior)
             for in_features, out_features in zip(layer_sizes, layer_sizes[1:])
         )
+        self.global_likelihood_sigma: GlobalLikelihoodSigma | None = None
+        if likelihood_std_model == "global":
+            self.global_likelihood_sigma = GlobalLikelihoodSigma(
+                init_std=global_likelihood_init_std,
+                prior_sigma=global_likelihood_prior_sigma,
+            )
+        elif likelihood_std_model != "heteroscedastic":
+            raise ValueError(f"Unsupported likelihood sigma model '{likelihood_std_model}'.")
 
         if activation == "relu":
             self.activation = F.relu
@@ -400,14 +617,26 @@ class BayesianRegressor(nn.Module):
         output, kl = self.layers[-1](x, sample=sample)
         total_kl = total_kl + kl
         mean = output[:, :1]
-        predictive_std = F.softplus(output[:, 1:]) + self.min_predictive_std
+        if self.likelihood_std_model == "heteroscedastic":
+            predictive_std = F.softplus(output[:, 1:]) + self.min_predictive_std
+        else:
+            if self.global_likelihood_sigma is None:
+                raise RuntimeError("The global likelihood sigma module is not initialized.")
+            predictive_std, sigma_prior_penalty = self.global_likelihood_sigma(mean)
+            total_kl = total_kl + sigma_prior_penalty
         return mean, predictive_std, total_kl
+
+    def current_global_likelihood_std(self) -> float | None:
+        if self.global_likelihood_sigma is None:
+            return None
+        return self.global_likelihood_sigma.current_std()
 
 
 def gaussian_nll(mean: torch.Tensor, predictive_std: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Negative log-likelihood under a Gaussian observation model."""
 
-    variance = predictive_std.pow(2)
+    safe_std = predictive_std.clamp_min(1e-8)
+    variance = safe_std.pow(2)
     return 0.5 * (((target - mean) ** 2) / variance + torch.log(2.0 * math.pi * variance))
 
 
@@ -658,6 +887,22 @@ def summarize_region_uncertainty(
 def save_checkpoint(
     model: BayesianRegressor,
     save_path: Path,
+    preset: str | None,
+    target_function: str,
+    likelihood_std_model: str,
+    global_likelihood_init_std: float | None,
+    global_likelihood_init_std_original_units: float | None,
+    global_likelihood_init_source: str | None,
+    global_likelihood_prior_sigma: float,
+    train_inputs: torch.Tensor,
+    train_targets: torch.Tensor,
+    observed_inputs: torch.Tensor | None,
+    observed_targets: torch.Tensor | None,
+    guide_inputs: torch.Tensor | None,
+    guide_targets: torch.Tensor | None,
+    guide_points_outside_intervals: int,
+    guide_points_interior_gaps: int,
+    guide_region_mode: str,
     hidden_dims: Sequence[int],
     activation: str,
     observed_intervals: Sequence[Interval],
@@ -678,6 +923,26 @@ def save_checkpoint(
 
     checkpoint = {
         "state_dict": model.state_dict(),
+        "preset": preset,
+        "target_function": target_function,
+        "likelihood_std_model": likelihood_std_model,
+        "global_likelihood_init_std": global_likelihood_init_std,
+        "global_likelihood_init_std_original_units": global_likelihood_init_std_original_units,
+        "global_likelihood_init_source": global_likelihood_init_source,
+        "global_likelihood_prior_sigma": global_likelihood_prior_sigma,
+        "global_likelihood_std": model.current_global_likelihood_std(),
+        "global_likelihood_std_original_units": None
+        if model.current_global_likelihood_std() is None
+        else to_original_target_std(model.current_global_likelihood_std(), scaler),
+        "train_inputs": train_inputs.detach().cpu(),
+        "train_targets": train_targets.detach().cpu(),
+        "observed_inputs": None if observed_inputs is None else observed_inputs.detach().cpu(),
+        "observed_targets": None if observed_targets is None else observed_targets.detach().cpu(),
+        "guide_inputs": None if guide_inputs is None else guide_inputs.detach().cpu(),
+        "guide_targets": None if guide_targets is None else guide_targets.detach().cpu(),
+        "guide_points_outside_intervals": guide_points_outside_intervals,
+        "guide_points_interior_gaps": guide_points_interior_gaps,
+        "guide_region_mode": guide_region_mode,
         "hidden_dims": list(hidden_dims),
         "activation": activation,
         "observed_intervals": list(observed_intervals),
@@ -701,13 +966,17 @@ def save_checkpoint(
 
 def plot_predictions(
     plot_path: Path,
-    train_inputs: torch.Tensor,
-    train_targets: torch.Tensor,
+    observed_inputs: torch.Tensor | None,
+    observed_targets: torch.Tensor | None,
+    guide_inputs: torch.Tensor | None,
+    guide_targets: torch.Tensor | None,
     grid_inputs: torch.Tensor,
+    reference_curve: torch.Tensor,
     summary: Dict[str, torch.Tensor],
     observed_intervals: Sequence[Interval],
     quantile_space: str = "function",
     shade_observed_intervals: bool = False,
+    show_summary_box: bool = True,
 ) -> None:
     """Save a plot with observed data, predictive median, IQR, and a 95% interval."""
 
@@ -730,15 +999,32 @@ def plot_predictions(
     else:
         raise ValueError(f"Unsupported quantile space '{quantile_space}'.")
 
-    x_train = train_inputs.squeeze(-1).cpu().numpy()
-    y_train = train_targets.squeeze(-1).cpu().numpy()
     x_grid = grid_inputs.squeeze(-1).cpu().numpy()
     median = summary[median_key].cpu().numpy()
     q25 = summary[q25_key].cpu().numpy()
     q75 = summary[q75_key].cpu().numpy()
     q025 = summary[q025_key].cpu().numpy()
     q975 = summary[q975_key].cpu().numpy()
-    band_width = q75 - q25
+    iqr_width = q75 - q25
+    interval95_width = q975 - q025
+
+    grid_inputs_cpu = grid_inputs.squeeze(-1).cpu()
+    observed_mask = torch.zeros_like(grid_inputs_cpu, dtype=torch.bool)
+    for left, right in observed_intervals:
+        observed_mask |= interval_mask(grid_inputs_cpu, left, right)
+    missing_mask = ~observed_mask
+
+    observed_mask_np = observed_mask.numpy()
+    missing_mask_np = missing_mask.numpy()
+
+    observed_iqr_mean = float(iqr_width[observed_mask_np].mean()) if observed_mask.any().item() else float("nan")
+    missing_iqr_mean = float(iqr_width[missing_mask_np].mean()) if missing_mask.any().item() else float("nan")
+    observed_interval95_mean = (
+        float(interval95_width[observed_mask_np].mean()) if observed_mask.any().item() else float("nan")
+    )
+    missing_interval95_mean = (
+        float(interval95_width[missing_mask_np].mean()) if missing_mask.any().item() else float("nan")
+    )
 
     figure, axis = plt.subplots(figsize=(10, 5))
 
@@ -746,8 +1032,25 @@ def plot_predictions(
         for left, right in observed_intervals:
             axis.axvspan(left, right, color="#d8f0d2", alpha=0.35, linewidth=0)
 
-    axis.scatter(x_train, y_train, color="black", marker="x", alpha=0.7, label="Observations")
-    reference = paper_regression_mean(grid_inputs).squeeze(-1).cpu().numpy()
+    if observed_inputs is not None and observed_targets is not None:
+        x_observed = observed_inputs.squeeze(-1).cpu().numpy()
+        y_observed = observed_targets.squeeze(-1).cpu().numpy()
+        axis.scatter(x_observed, y_observed, color="black", marker="x", alpha=0.7, label="Interval observations")
+    if guide_inputs is not None and guide_targets is not None:
+        x_guide = guide_inputs.squeeze(-1).cpu().numpy()
+        y_guide = guide_targets.squeeze(-1).cpu().numpy()
+        axis.scatter(
+            x_guide,
+            y_guide,
+            color="#d98b2b",
+            marker="o",
+            edgecolors="white",
+            linewidths=0.5,
+            s=28,
+            alpha=0.9,
+            label="Guide observations",
+        )
+    reference = reference_curve.squeeze(-1).cpu().numpy()
     axis.plot(x_grid, reference, color="#888888", linestyle="--", linewidth=1.5, label="Reference function")
 
     axis.fill_between(x_grid, q025, q975, color="#7eaee6", alpha=0.18, label="95% predictive interval", zorder=0)
@@ -761,15 +1064,21 @@ def plot_predictions(
     axis.set_title("Bayesian Regression with Disjoint Observation Intervals")
     axis.set_xlabel("x")
     axis.set_ylabel("y")
-    axis.text(
-        0.02,
-        0.02,
-        f"Mean IQR: {band_width.mean():.3f}",
-        transform=axis.transAxes,
-        fontsize=10,
-        color="#355c8a",
-        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.75, "edgecolor": "#b8cce6"},
-    )
+    if show_summary_box:
+        axis.text(
+            0.02,
+            0.02,
+            (
+                f"Observed mean IQR: {observed_iqr_mean:.3f}\n"
+                f"Missing mean IQR: {missing_iqr_mean:.3f}\n"
+                f"Observed mean 95% width: {observed_interval95_mean:.3f}\n"
+                f"Missing mean 95% width: {missing_interval95_mean:.3f}"
+            ),
+            transform=axis.transAxes,
+            fontsize=10,
+            color="#355c8a",
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.75, "edgecolor": "#b8cce6"},
+        )
     axis.legend()
     axis.grid(alpha=0.2)
     figure.tight_layout()
@@ -787,19 +1096,173 @@ def build_prior(args: argparse.Namespace) -> PriorDistribution:
     raise ValueError(f"Unsupported prior '{args.prior}'.")
 
 
+def build_prior_from_config(config: Dict[str, float | str | torch.Tensor]) -> PriorDistribution:
+    """Instantiate a prior from checkpoint metadata."""
+
+    prior_name = str(config["prior"])
+    if prior_name == "normal":
+        return NormalPrior(sigma=float(config["prior_sigma"]))
+    if prior_name == "spike-slab":
+        return SpikeAndSlabPrior(
+            pi=float(config["prior_pi"]),
+            sigma1=float(config["prior_sigma1"]),
+            sigma2=float(config["prior_sigma2"]),
+        )
+    raise ValueError(f"Unsupported prior '{prior_name}'.")
+
+
+@torch.no_grad()
+def plot_from_checkpoint(args: argparse.Namespace) -> None:
+    """Load a saved best checkpoint and generate a predictive plot without training."""
+
+    if args.plot_path is None:
+        raise ValueError("Provide --plot-path when using --plot-from-checkpoint.")
+
+    checkpoint = torch.load(args.plot_from_checkpoint, map_location="cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    prior = build_prior_from_config(checkpoint)
+    scaler = RegressionStandardizer.from_config(checkpoint)
+    likelihood_std_model = str(checkpoint.get("likelihood_std_model", "heteroscedastic"))
+    global_likelihood_init_std = checkpoint.get("global_likelihood_init_std")
+    if global_likelihood_init_std is None:
+        global_likelihood_init_std = float(checkpoint.get("noise_std", 0.02))
+
+    model = BayesianRegressor(
+        hidden_dims=checkpoint["hidden_dims"],
+        prior=prior,
+        activation=str(checkpoint["activation"]),
+        likelihood_std_model=likelihood_std_model,
+        global_likelihood_init_std=float(global_likelihood_init_std),
+        global_likelihood_prior_sigma=float(checkpoint.get("global_likelihood_prior_sigma", 1.0)),
+        min_predictive_std=float(checkpoint["min_predictive_std"]),
+    ).to(device)
+    model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
+
+    target_function_name = str(checkpoint.get("target_function", "oscillatory"))
+    _, reference_mean_fn = resolve_regression_target(target_function_name)
+    observed_intervals = [tuple(interval) for interval in checkpoint["observed_intervals"]]
+    domain_min = float(checkpoint["domain_min"])
+    domain_max = float(checkpoint["domain_max"])
+
+    grid_inputs = torch.linspace(domain_min, domain_max, steps=args.grid_size, dtype=torch.float32).unsqueeze(1)
+    scaled_grid_inputs = scaler.transform_inputs(grid_inputs)
+    prediction_summary = predict_distribution(
+        model=model,
+        inputs=scaled_grid_inputs,
+        num_samples=args.test_samples,
+        device=device,
+        scaler=scaler,
+    )
+    reference_curve = reference_mean_fn(grid_inputs)
+
+    observed_inputs = checkpoint.get("observed_inputs")
+    observed_targets = checkpoint.get("observed_targets")
+    if observed_inputs is None or observed_targets is None:
+        observed_inputs = checkpoint.get("train_inputs")
+        observed_targets = checkpoint.get("train_targets")
+    guide_inputs = checkpoint.get("guide_inputs")
+    guide_targets = checkpoint.get("guide_targets")
+    if observed_inputs is None or observed_targets is None:
+        print("Checkpoint has no saved training observations; the plot will omit data points.")
+        observed_inputs = None
+        observed_targets = None
+
+    print(f"Loaded checkpoint: {args.plot_from_checkpoint}")
+    print(f"Observed intervals: {intervals_to_string(observed_intervals)}")
+    print(f"Missing intervals: {intervals_to_string(complement_intervals(observed_intervals, domain_min, domain_max))}")
+    print(f"Target function: {target_function_name}")
+    print(f"Likelihood sigma model: {likelihood_std_model}")
+    guide_points_outside_intervals = int(checkpoint.get("guide_points_outside_intervals", 0))
+    guide_points_interior_gaps = int(checkpoint.get("guide_points_interior_gaps", 0))
+    guide_region_mode = str(checkpoint.get("guide_region_mode", "all-gaps"))
+    if guide_points_outside_intervals > 0 or guide_points_interior_gaps > 0:
+        print(
+            "Guide observations outside intervals: "
+            f"{guide_points_outside_intervals} ({guide_region_mode}), "
+            f"interior-gap guide points: {guide_points_interior_gaps}"
+        )
+    learned_global_std = model.current_global_likelihood_std()
+    if learned_global_std is not None:
+        learned_global_std_original = float(
+            checkpoint.get("global_likelihood_std_original_units", to_original_target_std(learned_global_std, scaler))
+        )
+        print(
+            "Global likelihood std: "
+            f"{learned_global_std:.4f} normalized, "
+            f"{learned_global_std_original:.4f} target units"
+        )
+    print("Uncertainty summary:")
+    for line in summarize_region_uncertainty(
+        grid_inputs=grid_inputs,
+        epistemic_std=prediction_summary["epistemic_std"],
+        predictive_std=prediction_summary["predictive_std"],
+        observed_intervals=observed_intervals,
+        domain_min=domain_min,
+        domain_max=domain_max,
+    ):
+        print(f"  {line}")
+
+    plot_predictions(
+        plot_path=args.plot_path,
+        observed_inputs=observed_inputs,
+        observed_targets=observed_targets,
+        guide_inputs=guide_inputs,
+        guide_targets=guide_targets,
+        grid_inputs=grid_inputs,
+        reference_curve=reference_curve,
+        summary=prediction_summary,
+        observed_intervals=observed_intervals,
+        quantile_space=args.plot_quantiles,
+        shade_observed_intervals=args.shade_observed_intervals,
+        show_summary_box=not args.hide_summary_box,
+    )
+    print(f"Saved predictive plot to {args.plot_path}")
+
+
 def parse_args() -> argparse.Namespace:
     """Define the command line interface."""
 
     parser = argparse.ArgumentParser(
-        description="Bayesian neural network regression with disjoint observed intervals."
+        description="Bayesian neural network regression with configurable observed intervals."
     )
 
-    parser.add_argument("--epochs", type=int, default=1500, help="Training epochs.")
+    parser.add_argument(
+        "--preset",
+        choices=["paper-figure5"],
+        default=None,
+        help="Optional preset that overrides the target function and interval/domain layout.",
+    )
+    parser.add_argument(
+        "--plot-from-checkpoint",
+        type=Path,
+        default=None,
+        help="Load a saved checkpoint and generate a plot without retraining.",
+    )
+    parser.add_argument("--epochs", type=int, default=1000, help="Training epochs.")
     parser.add_argument("--batch-size", type=int, default=32, help="Training batch size.")
     parser.add_argument("--hidden-dims", type=parse_hidden_dims, default=[256, 256, 256], help="Hidden layer sizes, e.g. 128,128.")
     parser.add_argument("--activation", choices=["gelu", "relu"], default="relu", help="Hidden-layer activation.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate.")
     parser.add_argument("--train-samples", type=int, default=3, help="Weight samples per training batch.")
+    parser.add_argument(
+        "--likelihood-std-model",
+        choices=["heteroscedastic", "global"],
+        default="global",
+        help="Use an x-dependent predicted sigma or a single learned global sigma.",
+    )
+    parser.add_argument(
+        "--global-likelihood-init-std",
+        type=float,
+        default=None,
+        help="Initial value of the learned global likelihood sigma in original target units. Defaults to a data-driven estimate from training observations.",
+    )
+    parser.add_argument(
+        "--global-likelihood-prior-sigma",
+        type=float,
+        default=1.0,
+        help="Standard deviation of the Gaussian prior on log(sigma) for the global likelihood option.",
+    )
     parser.add_argument(
         "--validation-samples",
         type=int,
@@ -808,6 +1271,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--test-samples", type=int, default=400, help="Weight samples for predictive summaries.")
     parser.add_argument("--train-points", type=int, default=192, help="Number of training points sampled from observed intervals.")
+    parser.add_argument(
+        "--target-function",
+        choices=["oscillatory", "paper"],
+        default="oscillatory",
+        help="Synthetic regression target to fit.",
+    )
     parser.add_argument(
         "--validation-fraction",
         type=float,
@@ -839,7 +1308,25 @@ def parse_args() -> argparse.Namespace:
         "--observed-intervals",
         type=parse_intervals,
         default=DEFAULT_OBSERVED_INTERVALS,
-        help="Comma-separated disjoint intervals such as -4:-2,-0.5:0.75,1.75:3.5.",
+        help="Comma-separated disjoint intervals such as -4:-2,-0.5:0.75,1.75:3.5 or a single interval like 0.0:0.5.",
+    )
+    parser.add_argument(
+        "--guide-points-outside-intervals",
+        type=int,
+        default=0,
+        help="Sparse extra observations sampled from gaps outside the main observed intervals and always kept in training.",
+    )
+    parser.add_argument(
+        "--guide-region-mode",
+        choices=["all-gaps", "outer-only"],
+        default="all-gaps",
+        help="Sample guide observations from all missing gaps or only from the outer extrapolation gaps.",
+    )
+    parser.add_argument(
+        "--guide-points-interior-gaps",
+        type=int,
+        default=0,
+        help="Additional sparse guide observations sampled only from interior gaps between observed intervals.",
     )
     parser.add_argument("--grid-size", type=int, default=500, help="Points used to evaluate the predictive curve.")
     parser.add_argument("--prior", choices=["normal", "spike-slab"], default="normal", help="Prior distribution over weights.")
@@ -849,6 +1336,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prior-sigma2", type=float, default=0.1, help="Small-variance standard deviation for the spike-and-slab prior.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--log-every", type=int, default=100, help="How often to print training progress.")
+    parser.add_argument(
+        "--checkpoint-save-every",
+        type=int,
+        default=20,
+        help="Flush the best checkpoint to disk at most once every this many epochs, plus a final save at the end.",
+    )
     parser.add_argument(
         "--save-path",
         type=Path,
@@ -863,6 +1356,11 @@ def parse_args() -> argparse.Namespace:
         help="Whether the plotted IQR should come from sampled latent functions or noisy observations.",
     )
     parser.add_argument(
+        "--hide-summary-box",
+        action="store_true",
+        help="Omit the plot textbox that reports mean IQR and mean 95% widths.",
+    )
+    parser.add_argument(
         "--shade-observed-intervals",
         action="store_true",
         help="Shade the input intervals that contain training observations.",
@@ -874,6 +1372,15 @@ def main() -> None:
     """Train a Bayesian regressor and report uncertainty in missing intervals."""
 
     args = parse_args()
+    if args.plot_from_checkpoint is not None:
+        if args.test_samples <= 0:
+            raise ValueError("The number of Monte Carlo samples must be positive.")
+        if args.grid_size <= 0:
+            raise ValueError("The grid size must be positive.")
+        plot_from_checkpoint(args)
+        return
+
+    args = apply_preset(args)
 
     if args.min_predictive_std <= 0.0:
         raise ValueError("The minimum predictive standard deviation must be positive.")
@@ -891,18 +1398,31 @@ def main() -> None:
         raise ValueError("The batch size must be positive.")
     if args.train_samples <= 0 or args.test_samples <= 0:
         raise ValueError("The number of Monte Carlo samples must be positive.")
+    if args.global_likelihood_init_std is not None and args.global_likelihood_init_std <= 0.0:
+        raise ValueError("The global likelihood initial standard deviation must be positive.")
+    if args.global_likelihood_prior_sigma <= 0.0:
+        raise ValueError("The global likelihood prior sigma must be positive.")
+    if args.guide_points_outside_intervals < 0:
+        raise ValueError("The number of guide points outside intervals must be non-negative.")
+    if args.guide_points_interior_gaps < 0:
+        raise ValueError("The number of guide points in interior gaps must be non-negative.")
+    if args.checkpoint_save_every <= 0:
+        raise ValueError("The checkpoint save interval must be positive.")
 
     validate_intervals_in_domain(args.observed_intervals, args.domain_min, args.domain_max)
     set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     prior = build_prior(args)
+    target_fn, reference_mean_fn = resolve_regression_target(args.target_function)
 
     raw_dataset = build_regression_dataset(
         intervals=args.observed_intervals,
         num_points=args.train_points,
         noise_std=args.noise_std,
+        target_fn=target_fn,
     )
+    observed_inputs, observed_targets = raw_dataset.tensors
     raw_train_dataset, raw_validation_dataset = split_tensor_dataset(
         raw_dataset,
         validation_fraction=args.validation_fraction,
@@ -910,7 +1430,47 @@ def main() -> None:
     )
     train_inputs, train_targets = raw_train_dataset.tensors
     validation_inputs, validation_targets = raw_validation_dataset.tensors
+    guide_inputs = None
+    guide_targets = None
+    guide_dataset = build_outside_interval_guide_dataset(
+        observed_intervals=args.observed_intervals,
+        domain_min=args.domain_min,
+        domain_max=args.domain_max,
+        num_points=args.guide_points_outside_intervals,
+        region_mode=args.guide_region_mode,
+        noise_std=args.noise_std,
+        target_fn=target_fn,
+    )
+    interior_guide_dataset = build_interior_gap_guide_dataset(
+        observed_intervals=args.observed_intervals,
+        num_points=args.guide_points_interior_gaps,
+        noise_std=args.noise_std,
+        target_fn=target_fn,
+    )
+    if guide_dataset is not None:
+        guide_inputs, guide_targets = guide_dataset.tensors
+        train_inputs = torch.cat([train_inputs, guide_inputs], dim=0)
+        train_targets = torch.cat([train_targets, guide_targets], dim=0)
+    if interior_guide_dataset is not None:
+        interior_guide_inputs, interior_guide_targets = interior_guide_dataset.tensors
+        if guide_inputs is None or guide_targets is None:
+            guide_inputs = interior_guide_inputs
+            guide_targets = interior_guide_targets
+        else:
+            guide_inputs = torch.cat([guide_inputs, interior_guide_inputs], dim=0)
+            guide_targets = torch.cat([guide_targets, interior_guide_targets], dim=0)
+        train_inputs = torch.cat([train_inputs, interior_guide_inputs], dim=0)
+        train_targets = torch.cat([train_targets, interior_guide_targets], dim=0)
     scaler = RegressionStandardizer.fit(train_inputs, train_targets)
+    global_likelihood_init_std, global_likelihood_init_std_original, global_likelihood_init_source = (
+        resolve_global_likelihood_init_std(
+            train_inputs=train_inputs,
+            train_targets=train_targets,
+            scaler=scaler,
+            min_predictive_std=args.min_predictive_std,
+            user_init_std_original_units=args.global_likelihood_init_std,
+        )
+    )
     train_dataset = TensorDataset(scaler.transform_inputs(train_inputs), scaler.transform_targets(train_targets))
     validation_dataset = TensorDataset(
         scaler.transform_inputs(validation_inputs),
@@ -923,6 +1483,9 @@ def main() -> None:
         hidden_dims=args.hidden_dims,
         prior=prior,
         activation=args.activation,
+        likelihood_std_model=args.likelihood_std_model,
+        global_likelihood_init_std=global_likelihood_init_std,
+        global_likelihood_prior_sigma=args.global_likelihood_prior_sigma,
         min_predictive_std=args.min_predictive_std,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -930,7 +1493,25 @@ def main() -> None:
     print(f"Using device: {device}")
     print(f"Observed intervals: {intervals_to_string(args.observed_intervals)}")
     print(f"Missing intervals: {intervals_to_string(complement_intervals(args.observed_intervals, args.domain_min, args.domain_max))}")
+    if args.preset is not None:
+        print(f"Preset: {args.preset}")
+    print(f"Target function: {args.target_function}")
     print(f"Prior: {prior.config()}")
+    print(f"Likelihood sigma model: {args.likelihood_std_model}")
+    if args.guide_points_outside_intervals > 0 or args.guide_points_interior_gaps > 0:
+        print(
+            "Guide observations outside intervals: "
+            f"{args.guide_points_outside_intervals} ({args.guide_region_mode}), "
+            f"interior-gap guide points: {args.guide_points_interior_gaps}"
+        )
+    if args.likelihood_std_model == "global":
+        print(
+            "Global likelihood sigma settings: "
+            f"init {global_likelihood_init_std:.4f} normalized, "
+            f"{global_likelihood_init_std_original:.4f} target units "
+            f"({global_likelihood_init_source}), "
+            f"log-sigma prior std {args.global_likelihood_prior_sigma:.4f}"
+        )
     print(f"Train / validation points: {len(train_dataset)} / {len(validation_dataset)}")
     print("Early stopping metric: validation predictive NLL")
 
@@ -938,6 +1519,57 @@ def main() -> None:
     best_epoch = 0
     best_state_dict = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
     epochs_without_improvement = 0
+    best_checkpoint_dirty = False
+
+    def persist_best_checkpoint(force: bool = False) -> None:
+        """Write the current best model to disk so interrupted runs remain usable."""
+
+        nonlocal best_checkpoint_dirty
+        if args.save_path is None:
+            return
+        if not force and (not best_checkpoint_dirty):
+            return
+
+        current_state_dict = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+        model.load_state_dict(best_state_dict)
+
+        save_checkpoint(
+            model=model,
+            save_path=args.save_path,
+            preset=args.preset,
+            target_function=args.target_function,
+            likelihood_std_model=args.likelihood_std_model,
+            global_likelihood_init_std=global_likelihood_init_std,
+            global_likelihood_init_std_original_units=global_likelihood_init_std_original,
+            global_likelihood_init_source=global_likelihood_init_source,
+            global_likelihood_prior_sigma=args.global_likelihood_prior_sigma,
+            train_inputs=train_inputs,
+            train_targets=train_targets,
+            observed_inputs=observed_inputs,
+            observed_targets=observed_targets,
+            guide_inputs=guide_inputs,
+            guide_targets=guide_targets,
+            guide_points_outside_intervals=args.guide_points_outside_intervals,
+            guide_points_interior_gaps=args.guide_points_interior_gaps,
+            guide_region_mode=args.guide_region_mode,
+            hidden_dims=args.hidden_dims,
+            activation=args.activation,
+            observed_intervals=args.observed_intervals,
+            domain_min=args.domain_min,
+            domain_max=args.domain_max,
+            min_predictive_std=args.min_predictive_std,
+            noise_std=args.noise_std,
+            validation_fraction=args.validation_fraction,
+            validation_samples=args.validation_samples,
+            early_stopping_patience=args.early_stopping_patience,
+            early_stopping_min_delta=args.early_stopping_min_delta,
+            best_epoch=best_epoch,
+            best_validation_predictive_nll=best_validation_predictive_nll,
+            scaler=scaler,
+            prior_config=prior.config(),
+        )
+        model.load_state_dict(current_state_dict)
+        best_checkpoint_dirty = False
 
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_epoch(
@@ -963,8 +1595,12 @@ def main() -> None:
             best_epoch = epoch
             best_state_dict = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
             epochs_without_improvement = 0
+            best_checkpoint_dirty = True
         else:
             epochs_without_improvement += 1
+
+        if epoch % args.checkpoint_save_every == 0:
+            persist_best_checkpoint()
 
         should_log = epoch == 1 or epoch == args.epochs or epoch % args.log_every == 0
         if should_log:
@@ -989,6 +1625,7 @@ def main() -> None:
         best_epoch = args.epochs
         best_validation_predictive_nll = validation_metrics["predictive_nll"]
         best_state_dict = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+        best_checkpoint_dirty = True
 
     model.load_state_dict(best_state_dict)
     final_validation_metrics = evaluate_regression(
@@ -1002,9 +1639,18 @@ def main() -> None:
         f"Restored best model from epoch {best_epoch:04d} | "
         f"val pred-nll {final_validation_metrics['predictive_nll']:.4f}"
     )
+    learned_global_std = model.current_global_likelihood_std()
+    if learned_global_std is not None:
+        learned_global_std_original = to_original_target_std(learned_global_std, scaler)
+        print(
+            "Restored global likelihood std: "
+            f"{learned_global_std:.4f} normalized, "
+            f"{learned_global_std_original:.4f} target units"
+        )
 
     grid_inputs = torch.linspace(args.domain_min, args.domain_max, steps=args.grid_size, dtype=torch.float32).unsqueeze(1)
     scaled_grid_inputs = scaler.transform_inputs(grid_inputs)
+    reference_curve = reference_mean_fn(grid_inputs)
     prediction_summary = predict_distribution(
         model=model,
         inputs=scaled_grid_inputs,
@@ -1025,37 +1671,23 @@ def main() -> None:
         print(f"  {line}")
 
     if args.save_path is not None:
-        save_checkpoint(
-            model=model,
-            save_path=args.save_path,
-            hidden_dims=args.hidden_dims,
-            activation=args.activation,
-            observed_intervals=args.observed_intervals,
-            domain_min=args.domain_min,
-            domain_max=args.domain_max,
-            min_predictive_std=args.min_predictive_std,
-            noise_std=args.noise_std,
-            validation_fraction=args.validation_fraction,
-            validation_samples=args.validation_samples,
-            early_stopping_patience=args.early_stopping_patience,
-            early_stopping_min_delta=args.early_stopping_min_delta,
-            best_epoch=best_epoch,
-            best_validation_predictive_nll=best_validation_predictive_nll,
-            scaler=scaler,
-            prior_config=prior.config(),
-        )
+        persist_best_checkpoint(force=True)
         print(f"Saved checkpoint to {args.save_path}")
 
     if args.plot_path is not None:
         plot_predictions(
             plot_path=args.plot_path,
-            train_inputs=train_inputs,
-            train_targets=train_targets,
+            observed_inputs=observed_inputs,
+            observed_targets=observed_targets,
+            guide_inputs=guide_inputs,
+            guide_targets=guide_targets,
             grid_inputs=grid_inputs,
+            reference_curve=reference_curve,
             summary=prediction_summary,
             observed_intervals=args.observed_intervals,
             quantile_space=args.plot_quantiles,
             shade_observed_intervals=args.shade_observed_intervals,
+            show_summary_box=not args.hide_summary_box,
         )
         print(f"Saved predictive plot to {args.plot_path}")
 
