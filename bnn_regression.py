@@ -187,7 +187,11 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
     raise ValueError(f"Unsupported preset '{args.preset}'.")
 
 
-def sample_inputs_from_intervals(intervals: Sequence[Interval], num_points: int) -> torch.Tensor:
+def sample_inputs_from_intervals(
+    intervals: Sequence[Interval],
+    num_points: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
     """Sample one-dimensional inputs uniformly from the observed intervals."""
 
     if num_points < len(intervals):
@@ -195,7 +199,7 @@ def sample_inputs_from_intervals(intervals: Sequence[Interval], num_points: int)
 
     lengths = torch.tensor([right - left for left, right in intervals], dtype=torch.float32)
     probabilities = lengths / lengths.sum()
-    interval_indices = torch.multinomial(probabilities, num_samples=num_points, replacement=True)
+    interval_indices = torch.multinomial(probabilities, num_samples=num_points, replacement=True, generator=generator)
 
     samples = torch.empty(num_points, dtype=torch.float32)
     for index, (left, right) in enumerate(intervals):
@@ -203,7 +207,7 @@ def sample_inputs_from_intervals(intervals: Sequence[Interval], num_points: int)
         count = int(mask.sum().item())
         if count == 0:
             continue
-        samples[mask] = left + (right - left) * torch.rand(count, dtype=torch.float32)
+        samples[mask] = left + (right - left) * torch.rand(count, dtype=torch.float32, generator=generator)
 
     return samples.unsqueeze(1)
 
@@ -420,6 +424,30 @@ def resolve_global_likelihood_init_std(
     return init_std_normalized, init_std_original, source
 
 
+def resolve_global_likelihood_prior_mean_std(
+    scaler: RegressionStandardizer,
+    min_predictive_std: float,
+    user_prior_mean_std_original_units: float | None,
+    default_prior_mean_std_original_units: float,
+) -> Tuple[float, float, str]:
+    """Choose the prior mean of the global likelihood sigma in normalized and original units."""
+
+    if user_prior_mean_std_original_units is None:
+        prior_mean_std_original = float(default_prior_mean_std_original_units)
+        source = "default"
+    else:
+        if user_prior_mean_std_original_units <= 0.0:
+            raise ValueError("The global likelihood prior-mean standard deviation must be positive.")
+        prior_mean_std_original = float(user_prior_mean_std_original_units)
+        source = "user"
+
+    target_scale = float(scaler.target_std.squeeze().item())
+    normalized_floor = max(min_predictive_std / target_scale, 1e-6)
+    prior_mean_std_normalized = max(prior_mean_std_original / target_scale, normalized_floor)
+    prior_mean_std_original = prior_mean_std_normalized * target_scale
+    return prior_mean_std_normalized, prior_mean_std_original, source
+
+
 def gaussian_log_prob(value: torch.Tensor, mean: torch.Tensor | float, sigma: torch.Tensor) -> torch.Tensor:
     """Elementwise Gaussian log-density."""
 
@@ -540,16 +568,18 @@ class BayesianLinear(nn.Module):
 class GlobalLikelihoodSigma(nn.Module):
     """Single learned likelihood standard deviation shared across all inputs."""
 
-    def __init__(self, init_std: float, prior_sigma: float) -> None:
+    def __init__(self, init_std: float, prior_mean_std: float, prior_sigma: float) -> None:
         super().__init__()
 
         if init_std <= 0.0:
             raise ValueError("The global likelihood initial standard deviation must be positive.")
+        if prior_mean_std <= 0.0:
+            raise ValueError("The global likelihood prior-mean standard deviation must be positive.")
         if prior_sigma <= 0.0:
             raise ValueError("The global likelihood prior sigma must be positive.")
 
         self.log_std = nn.Parameter(torch.tensor(math.log(init_std), dtype=torch.float32))
-        self.prior_mean_log_std = math.log(init_std)
+        self.prior_mean_log_std = math.log(prior_mean_std)
         self.prior_sigma = prior_sigma
 
     def forward(self, reference: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -574,6 +604,7 @@ class BayesianRegressor(nn.Module):
         activation: str = "gelu",
         likelihood_std_model: str = "heteroscedastic",
         global_likelihood_init_std: float = 0.02,
+        global_likelihood_prior_mean_std: float = 0.02,
         global_likelihood_prior_sigma: float = 1.0,
         min_predictive_std: float = 1e-3,
     ) -> None:
@@ -594,6 +625,7 @@ class BayesianRegressor(nn.Module):
         if likelihood_std_model == "global":
             self.global_likelihood_sigma = GlobalLikelihoodSigma(
                 init_std=global_likelihood_init_std,
+                prior_mean_std=global_likelihood_prior_mean_std,
                 prior_sigma=global_likelihood_prior_sigma,
             )
         elif likelihood_std_model != "heteroscedastic":
@@ -884,6 +916,101 @@ def summarize_region_uncertainty(
     return lines
 
 
+def compute_interval_coverage(summary: Dict[str, torch.Tensor], targets: torch.Tensor) -> Dict[str, float]:
+    """Compute empirical coverage for function-space and observation-space quantiles."""
+
+    flattened_targets = targets.squeeze(-1)
+    return {
+        "observation_iqr": float(
+            ((flattened_targets >= summary["observation_q25"]) & (flattened_targets <= summary["observation_q75"]))
+            .float()
+            .mean()
+            .item()
+        ),
+        "observation_95": float(
+            ((flattened_targets >= summary["observation_q025"]) & (flattened_targets <= summary["observation_q975"]))
+            .float()
+            .mean()
+            .item()
+        ),
+        "function_iqr": float(
+            ((flattened_targets >= summary["function_q25"]) & (flattened_targets <= summary["function_q75"]))
+            .float()
+            .mean()
+            .item()
+        ),
+        "function_95": float(
+            ((flattened_targets >= summary["function_q025"]) & (flattened_targets <= summary["function_q975"]))
+            .float()
+            .mean()
+            .item()
+        ),
+    }
+
+
+@torch.no_grad()
+def evaluate_generated_coverage(
+    model: BayesianRegressor,
+    scaler: RegressionStandardizer,
+    target_fn: Callable[[torch.Tensor, float], torch.Tensor],
+    observed_intervals: Sequence[Interval],
+    domain_min: float,
+    domain_max: float,
+    noise_std: float,
+    num_points: int,
+    predictive_samples: int,
+    seed: int,
+    device: torch.device,
+) -> Dict[str, Dict[str, float]]:
+    """Estimate empirical interval coverage on fresh generated noisy points."""
+
+    if num_points <= 0:
+        raise ValueError("The number of generated coverage points must be positive.")
+    if predictive_samples <= 0:
+        raise ValueError("The number of predictive samples for coverage must be positive.")
+
+    with torch.random.fork_rng():
+        torch.manual_seed(seed)
+        generator = torch.Generator().manual_seed(seed)
+
+        full_inputs = domain_min + (domain_max - domain_min) * torch.rand((num_points, 1), generator=generator)
+        full_targets = target_fn(full_inputs, noise_std=noise_std)
+        full_summary = predict_distribution(
+            model=model,
+            inputs=scaler.transform_inputs(full_inputs),
+            num_samples=predictive_samples,
+            device=device,
+            scaler=scaler,
+        )
+
+        interval_inputs = sample_inputs_from_intervals(observed_intervals, num_points=num_points, generator=generator)
+        interval_targets = target_fn(interval_inputs, noise_std=noise_std)
+        interval_summary = predict_distribution(
+            model=model,
+            inputs=scaler.transform_inputs(interval_inputs),
+            num_samples=predictive_samples,
+            device=device,
+            scaler=scaler,
+        )
+
+    return {
+        "full_domain_uniform": compute_interval_coverage(full_summary, full_targets),
+        "observed_intervals_only": compute_interval_coverage(interval_summary, interval_targets),
+    }
+
+
+def print_generated_coverage_results(results: Dict[str, Dict[str, float]], num_points: int) -> None:
+    """Print generated-point coverage results in a stable human-readable format."""
+
+    print(f"Generated coverage test ({num_points} fresh noisy points):")
+    for mode_name, metrics in results.items():
+        print(f"  {mode_name}:")
+        print(f"    observation IQR coverage = {metrics['observation_iqr'] * 100.0:.1f}%")
+        print(f"    observation 95% coverage = {metrics['observation_95'] * 100.0:.1f}%")
+        print(f"    function IQR coverage = {metrics['function_iqr'] * 100.0:.1f}%")
+        print(f"    function 95% coverage = {metrics['function_95'] * 100.0:.1f}%")
+
+
 def save_checkpoint(
     model: BayesianRegressor,
     save_path: Path,
@@ -893,6 +1020,9 @@ def save_checkpoint(
     global_likelihood_init_std: float | None,
     global_likelihood_init_std_original_units: float | None,
     global_likelihood_init_source: str | None,
+    global_likelihood_prior_mean_std: float | None,
+    global_likelihood_prior_mean_std_original_units: float | None,
+    global_likelihood_prior_mean_source: str | None,
     global_likelihood_prior_sigma: float,
     train_inputs: torch.Tensor,
     train_targets: torch.Tensor,
@@ -929,6 +1059,9 @@ def save_checkpoint(
         "global_likelihood_init_std": global_likelihood_init_std,
         "global_likelihood_init_std_original_units": global_likelihood_init_std_original_units,
         "global_likelihood_init_source": global_likelihood_init_source,
+        "global_likelihood_prior_mean_std": global_likelihood_prior_mean_std,
+        "global_likelihood_prior_mean_std_original_units": global_likelihood_prior_mean_std_original_units,
+        "global_likelihood_prior_mean_source": global_likelihood_prior_mean_source,
         "global_likelihood_prior_sigma": global_likelihood_prior_sigma,
         "global_likelihood_std": model.current_global_likelihood_std(),
         "global_likelihood_std_original_units": None
@@ -1126,6 +1259,9 @@ def plot_from_checkpoint(args: argparse.Namespace) -> None:
     global_likelihood_init_std = checkpoint.get("global_likelihood_init_std")
     if global_likelihood_init_std is None:
         global_likelihood_init_std = float(checkpoint.get("noise_std", 0.02))
+    global_likelihood_prior_mean_std = checkpoint.get("global_likelihood_prior_mean_std")
+    if global_likelihood_prior_mean_std is None:
+        global_likelihood_prior_mean_std = float(global_likelihood_init_std)
 
     model = BayesianRegressor(
         hidden_dims=checkpoint["hidden_dims"],
@@ -1133,6 +1269,7 @@ def plot_from_checkpoint(args: argparse.Namespace) -> None:
         activation=str(checkpoint["activation"]),
         likelihood_std_model=likelihood_std_model,
         global_likelihood_init_std=float(global_likelihood_init_std),
+        global_likelihood_prior_mean_std=float(global_likelihood_prior_mean_std),
         global_likelihood_prior_sigma=float(checkpoint.get("global_likelihood_prior_sigma", 1.0)),
         min_predictive_std=float(checkpoint["min_predictive_std"]),
     ).to(device)
@@ -1203,6 +1340,23 @@ def plot_from_checkpoint(args: argparse.Namespace) -> None:
     ):
         print(f"  {line}")
 
+    if args.coverage_eval_points > 0:
+        target_fn, _ = resolve_regression_target(target_function_name)
+        coverage_results = evaluate_generated_coverage(
+            model=model,
+            scaler=scaler,
+            target_fn=target_fn,
+            observed_intervals=observed_intervals,
+            domain_min=domain_min,
+            domain_max=domain_max,
+            noise_std=float(checkpoint.get("noise_std", 0.02)),
+            num_points=args.coverage_eval_points,
+            predictive_samples=args.coverage_eval_samples,
+            seed=args.coverage_eval_seed,
+            device=device,
+        )
+        print_generated_coverage_results(coverage_results, num_points=args.coverage_eval_points)
+
     plot_predictions(
         plot_path=args.plot_path,
         observed_inputs=observed_inputs,
@@ -1256,6 +1410,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Initial value of the learned global likelihood sigma in original target units. Defaults to a data-driven estimate from training observations.",
+    )
+    parser.add_argument(
+        "--global-likelihood-prior-mean-std",
+        type=float,
+        default=None,
+        help="Prior mean of the learned global likelihood sigma in original target units. Defaults to the resolved init value.",
     )
     parser.add_argument(
         "--global-likelihood-prior-sigma",
@@ -1365,6 +1525,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Shade the input intervals that contain training observations.",
     )
+    parser.add_argument(
+        "--coverage-eval-points",
+        type=int,
+        default=0,
+        help="Optional number of fresh generated noisy points used for empirical interval coverage evaluation.",
+    )
+    parser.add_argument(
+        "--coverage-eval-samples",
+        type=int,
+        default=1000,
+        help="Monte Carlo predictive samples used for generated coverage evaluation.",
+    )
+    parser.add_argument(
+        "--coverage-eval-seed",
+        type=int,
+        default=42,
+        help="Random seed used for the generated coverage evaluation.",
+    )
     return parser.parse_args()
 
 
@@ -1377,6 +1555,10 @@ def main() -> None:
             raise ValueError("The number of Monte Carlo samples must be positive.")
         if args.grid_size <= 0:
             raise ValueError("The grid size must be positive.")
+        if args.coverage_eval_points < 0:
+            raise ValueError("The number of generated coverage-evaluation points must be non-negative.")
+        if args.coverage_eval_samples <= 0:
+            raise ValueError("The number of predictive samples for coverage evaluation must be positive.")
         plot_from_checkpoint(args)
         return
 
@@ -1398,8 +1580,14 @@ def main() -> None:
         raise ValueError("The batch size must be positive.")
     if args.train_samples <= 0 or args.test_samples <= 0:
         raise ValueError("The number of Monte Carlo samples must be positive.")
+    if args.coverage_eval_points < 0:
+        raise ValueError("The number of generated coverage-evaluation points must be non-negative.")
+    if args.coverage_eval_samples <= 0:
+        raise ValueError("The number of predictive samples for coverage evaluation must be positive.")
     if args.global_likelihood_init_std is not None and args.global_likelihood_init_std <= 0.0:
         raise ValueError("The global likelihood initial standard deviation must be positive.")
+    if args.global_likelihood_prior_mean_std is not None and args.global_likelihood_prior_mean_std <= 0.0:
+        raise ValueError("The global likelihood prior-mean standard deviation must be positive.")
     if args.global_likelihood_prior_sigma <= 0.0:
         raise ValueError("The global likelihood prior sigma must be positive.")
     if args.guide_points_outside_intervals < 0:
@@ -1471,6 +1659,14 @@ def main() -> None:
             user_init_std_original_units=args.global_likelihood_init_std,
         )
     )
+    global_likelihood_prior_mean_std, global_likelihood_prior_mean_std_original, global_likelihood_prior_mean_source = (
+        resolve_global_likelihood_prior_mean_std(
+            scaler=scaler,
+            min_predictive_std=args.min_predictive_std,
+            user_prior_mean_std_original_units=args.global_likelihood_prior_mean_std,
+            default_prior_mean_std_original_units=global_likelihood_init_std_original,
+        )
+    )
     train_dataset = TensorDataset(scaler.transform_inputs(train_inputs), scaler.transform_targets(train_targets))
     validation_dataset = TensorDataset(
         scaler.transform_inputs(validation_inputs),
@@ -1485,6 +1681,7 @@ def main() -> None:
         activation=args.activation,
         likelihood_std_model=args.likelihood_std_model,
         global_likelihood_init_std=global_likelihood_init_std,
+        global_likelihood_prior_mean_std=global_likelihood_prior_mean_std,
         global_likelihood_prior_sigma=args.global_likelihood_prior_sigma,
         min_predictive_std=args.min_predictive_std,
     ).to(device)
@@ -1509,7 +1706,10 @@ def main() -> None:
             "Global likelihood sigma settings: "
             f"init {global_likelihood_init_std:.4f} normalized, "
             f"{global_likelihood_init_std_original:.4f} target units "
-            f"({global_likelihood_init_source}), "
+            f"({global_likelihood_init_source}); "
+            f"prior mean {global_likelihood_prior_mean_std:.4f} normalized, "
+            f"{global_likelihood_prior_mean_std_original:.4f} target units "
+            f"({global_likelihood_prior_mean_source}); "
             f"log-sigma prior std {args.global_likelihood_prior_sigma:.4f}"
         )
     print(f"Train / validation points: {len(train_dataset)} / {len(validation_dataset)}")
@@ -1542,6 +1742,9 @@ def main() -> None:
             global_likelihood_init_std=global_likelihood_init_std,
             global_likelihood_init_std_original_units=global_likelihood_init_std_original,
             global_likelihood_init_source=global_likelihood_init_source,
+            global_likelihood_prior_mean_std=global_likelihood_prior_mean_std,
+            global_likelihood_prior_mean_std_original_units=global_likelihood_prior_mean_std_original,
+            global_likelihood_prior_mean_source=global_likelihood_prior_mean_source,
             global_likelihood_prior_sigma=args.global_likelihood_prior_sigma,
             train_inputs=train_inputs,
             train_targets=train_targets,
@@ -1669,6 +1872,22 @@ def main() -> None:
         domain_max=args.domain_max,
     ):
         print(f"  {line}")
+
+    if args.coverage_eval_points > 0:
+        coverage_results = evaluate_generated_coverage(
+            model=model,
+            scaler=scaler,
+            target_fn=target_fn,
+            observed_intervals=args.observed_intervals,
+            domain_min=args.domain_min,
+            domain_max=args.domain_max,
+            noise_std=args.noise_std,
+            num_points=args.coverage_eval_points,
+            predictive_samples=args.coverage_eval_samples,
+            seed=args.coverage_eval_seed,
+            device=device,
+        )
+        print_generated_coverage_results(coverage_results, num_points=args.coverage_eval_points)
 
     if args.save_path is not None:
         persist_best_checkpoint(force=True)

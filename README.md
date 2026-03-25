@@ -150,7 +150,10 @@ Useful regression options:
 - `--likelihood-std-model global` is the default
 - `--likelihood-std-model heteroscedastic`
 - `--global-likelihood-init-std 0.02` is interpreted in original target units; if omitted, the global sigma init is estimated from nearby training-target differences
+- `--global-likelihood-prior-mean-std 0.02` sets the prior mean of the global sigma in original target units; if omitted, it defaults to the resolved init value
 - `--global-likelihood-prior-sigma 1.0`
+- `--coverage-eval-points 500`
+- `--coverage-eval-samples 1000`
 - `--prior normal`
 - `--prior spike-slab`
 - `--save-path checkpoints/bnn_regression_best.pt`
