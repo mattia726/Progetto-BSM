@@ -48,6 +48,23 @@ def parse_hidden_dims(value: str) -> List[int]:
     return dims
 
 
+def parse_float_list(value: str) -> List[float]:
+    """Parse a comma-separated list of floats."""
+
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("The list must not be empty.")
+
+    values: List[float] = []
+    for part in parts:
+        try:
+            values.append(float(part))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"Invalid numeric value '{part}'.") from exc
+
+    return values
+
+
 def parse_intervals(value: str) -> List[Interval]:
     """Parse intervals written as 'left:right,left:right'."""
 
@@ -212,16 +229,55 @@ def sample_inputs_from_intervals(
     return samples.unsqueeze(1)
 
 
+def sample_targets_with_interval_noise(
+    inputs: torch.Tensor,
+    target_fn: Callable[[torch.Tensor, float], torch.Tensor],
+    default_noise_std: float,
+    intervals: Sequence[Interval],
+    interval_noise_stds: Sequence[float] | None = None,
+) -> torch.Tensor:
+    """Sample targets with optional interval-specific observation noise."""
+
+    if interval_noise_stds is None:
+        return target_fn(inputs, noise_std=default_noise_std)
+
+    if len(interval_noise_stds) != len(intervals):
+        raise ValueError("Provide exactly one interval noise standard deviation per observed interval.")
+
+    targets = torch.empty_like(inputs)
+    assigned_mask = torch.zeros(inputs.size(0), dtype=torch.bool, device=inputs.device)
+    flat_inputs = inputs.squeeze(-1)
+    for (left, right), interval_noise_std in zip(intervals, interval_noise_stds):
+        mask = interval_mask(flat_inputs, left, right)
+        if not mask.any():
+            continue
+        targets[mask] = target_fn(inputs[mask], noise_std=float(interval_noise_std))
+        assigned_mask |= mask
+
+    remaining_mask = ~assigned_mask
+    if remaining_mask.any():
+        targets[remaining_mask] = target_fn(inputs[remaining_mask], noise_std=default_noise_std)
+
+    return targets
+
+
 def build_regression_dataset(
     intervals: Sequence[Interval],
     num_points: int,
     noise_std: float,
     target_fn: Callable[[torch.Tensor, float], torch.Tensor],
+    interval_noise_stds: Sequence[float] | None = None,
 ) -> TensorDataset:
     """Create a synthetic regression dataset restricted to observed intervals."""
 
     inputs = sample_inputs_from_intervals(intervals, num_points=num_points)
-    targets = target_fn(inputs, noise_std=noise_std)
+    targets = sample_targets_with_interval_noise(
+        inputs=inputs,
+        target_fn=target_fn,
+        default_noise_std=noise_std,
+        intervals=intervals,
+        interval_noise_stds=interval_noise_stds,
+    )
     return TensorDataset(inputs, targets)
 
 
@@ -448,6 +504,79 @@ def resolve_global_likelihood_prior_mean_std(
     return prior_mean_std_normalized, prior_mean_std_original, source
 
 
+def resolve_spline_knots_original(
+    domain_min: float,
+    domain_max: float,
+    user_knots_original_units: Sequence[float] | None,
+    num_knots: int,
+) -> Tuple[List[float], str]:
+    """Resolve spline knots in original x units."""
+
+    tolerance = 1e-6
+    if user_knots_original_units is None:
+        if num_knots < 2:
+            raise ValueError("The spline likelihood model needs at least two knots.")
+        knots = np.linspace(domain_min, domain_max, num=num_knots, dtype=np.float64).tolist()
+        source = "uniform"
+    else:
+        if len(user_knots_original_units) < 2:
+            raise ValueError("The spline likelihood model needs at least two knots.")
+        knots = [float(knot) for knot in user_knots_original_units]
+        source = "user"
+
+    for previous, current in zip(knots, knots[1:]):
+        if current <= previous:
+            raise ValueError("Spline knots must be strictly increasing.")
+    if knots[0] < domain_min - tolerance or knots[-1] > domain_max + tolerance:
+        raise ValueError("Spline knots must lie inside the configured domain.")
+    knots[0] = max(knots[0], domain_min)
+    knots[-1] = min(knots[-1], domain_max)
+
+    return knots, source
+
+
+def normalize_input_locations(locations: Sequence[float], scaler: RegressionStandardizer) -> List[float]:
+    """Transform one-dimensional x locations into the model's normalized input space."""
+
+    points = torch.tensor(locations, dtype=torch.float32).unsqueeze(1)
+    normalized = scaler.transform_inputs(points).squeeze(1)
+    return [float(value.item()) for value in normalized]
+
+
+def natural_cubic_spline_basis(x: torch.Tensor, knots: torch.Tensor) -> torch.Tensor:
+    """Return the restricted natural cubic spline basis without the intercept."""
+
+    if knots.ndim != 1:
+        raise ValueError("Spline knots must be a one-dimensional tensor.")
+    if knots.numel() < 2:
+        raise ValueError("At least two spline knots are required.")
+
+    flat_x = x.reshape(-1, 1)
+    knots = knots.to(device=flat_x.device, dtype=flat_x.dtype)
+    basis_terms = [flat_x]
+    if knots.numel() == 2:
+        return torch.cat(basis_terms, dim=1)
+
+    last_knot = knots[-1]
+    penultimate_knot = knots[-2]
+    penultimate_denominator = last_knot - penultimate_knot
+    if penultimate_denominator <= 0:
+        raise ValueError("Spline knots must be strictly increasing.")
+
+    def truncated_cubic(center: torch.Tensor) -> torch.Tensor:
+        return torch.clamp(flat_x - center, min=0.0).pow(3)
+
+    tail_term = (truncated_cubic(penultimate_knot) - truncated_cubic(last_knot)) / penultimate_denominator
+    for knot in knots[:-2]:
+        denominator = last_knot - knot
+        if denominator <= 0:
+            raise ValueError("Spline knots must be strictly increasing.")
+        raw_term = (truncated_cubic(knot) - truncated_cubic(last_knot)) / denominator
+        basis_terms.append(raw_term - tail_term)
+
+    return torch.cat(basis_terms, dim=1)
+
+
 def gaussian_log_prob(value: torch.Tensor, mean: torch.Tensor | float, sigma: torch.Tensor) -> torch.Tensor:
     """Elementwise Gaussian log-density."""
 
@@ -594,6 +723,62 @@ class GlobalLikelihoodSigma(nn.Module):
         return float(torch.exp(self.log_std.detach()).item())
 
 
+class SplineLikelihoodSigma(nn.Module):
+    """Natural cubic spline model for log(sigma(x)) with independent coefficient priors."""
+
+    def __init__(
+        self,
+        init_std: float,
+        prior_mean_std: float,
+        prior_sigma: float,
+        knots: Sequence[float],
+        coefficient_prior_sigma: float,
+    ) -> None:
+        super().__init__()
+
+        if init_std <= 0.0:
+            raise ValueError("The spline likelihood initial standard deviation must be positive.")
+        if prior_mean_std <= 0.0:
+            raise ValueError("The spline likelihood prior-mean standard deviation must be positive.")
+        if prior_sigma <= 0.0:
+            raise ValueError("The spline likelihood intercept prior sigma must be positive.")
+        if coefficient_prior_sigma <= 0.0:
+            raise ValueError("The spline likelihood coefficient prior sigma must be positive.")
+        if len(knots) < 2:
+            raise ValueError("The spline likelihood model needs at least two knots.")
+
+        knot_tensor = torch.tensor(knots, dtype=torch.float32)
+        if torch.any(knot_tensor[1:] <= knot_tensor[:-1]):
+            raise ValueError("Spline knots must be strictly increasing.")
+
+        basis_size = natural_cubic_spline_basis(
+            torch.zeros(1, 1, dtype=torch.float32),
+            knot_tensor,
+        ).size(1)
+        self.register_buffer("knots", knot_tensor)
+        self.log_std_intercept = nn.Parameter(torch.tensor(math.log(init_std), dtype=torch.float32))
+        self.coefficients = nn.Parameter(torch.zeros(basis_size, dtype=torch.float32))
+        self.intercept_prior_mean_log_std = math.log(prior_mean_std)
+        self.intercept_prior_sigma = prior_sigma
+        self.coefficient_prior_sigma = coefficient_prior_sigma
+
+    def forward(self, reference_x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        flat_x = reference_x.reshape(-1, 1)
+        knots = self.knots.to(device=flat_x.device, dtype=flat_x.dtype)
+        basis = natural_cubic_spline_basis(flat_x, knots)
+        intercept = self.log_std_intercept.to(device=flat_x.device, dtype=flat_x.dtype)
+        coefficients = self.coefficients.to(device=flat_x.device, dtype=flat_x.dtype)
+        log_std = intercept + basis.matmul(coefficients.unsqueeze(-1))
+        sigma = torch.exp(log_std)
+
+        intercept_prior_mean = flat_x.new_tensor(self.intercept_prior_mean_log_std)
+        intercept_prior_sigma = flat_x.new_tensor(self.intercept_prior_sigma)
+        coefficient_prior_sigma = flat_x.new_tensor(self.coefficient_prior_sigma)
+        prior_penalty = -gaussian_log_prob(intercept, intercept_prior_mean, intercept_prior_sigma)
+        prior_penalty = prior_penalty - gaussian_log_prob(coefficients, 0.0, coefficient_prior_sigma).sum()
+        return sigma, prior_penalty
+
+
 class BayesianRegressor(nn.Module):
     """Small Bayesian MLP that predicts a Gaussian mean and either local or global scale."""
 
@@ -606,6 +791,8 @@ class BayesianRegressor(nn.Module):
         global_likelihood_init_std: float = 0.02,
         global_likelihood_prior_mean_std: float = 0.02,
         global_likelihood_prior_sigma: float = 1.0,
+        spline_knots: Sequence[float] | None = None,
+        spline_coefficient_prior_sigma: float = 1.0,
         min_predictive_std: float = 1e-3,
     ) -> None:
         super().__init__()
@@ -622,11 +809,22 @@ class BayesianRegressor(nn.Module):
             for in_features, out_features in zip(layer_sizes, layer_sizes[1:])
         )
         self.global_likelihood_sigma: GlobalLikelihoodSigma | None = None
+        self.spline_likelihood_sigma: SplineLikelihoodSigma | None = None
         if likelihood_std_model == "global":
             self.global_likelihood_sigma = GlobalLikelihoodSigma(
                 init_std=global_likelihood_init_std,
                 prior_mean_std=global_likelihood_prior_mean_std,
                 prior_sigma=global_likelihood_prior_sigma,
+            )
+        elif likelihood_std_model == "spline":
+            if spline_knots is None:
+                raise ValueError("Provide spline knots when likelihood_std_model='spline'.")
+            self.spline_likelihood_sigma = SplineLikelihoodSigma(
+                init_std=global_likelihood_init_std,
+                prior_mean_std=global_likelihood_prior_mean_std,
+                prior_sigma=global_likelihood_prior_sigma,
+                knots=spline_knots,
+                coefficient_prior_sigma=spline_coefficient_prior_sigma,
             )
         elif likelihood_std_model != "heteroscedastic":
             raise ValueError(f"Unsupported likelihood sigma model '{likelihood_std_model}'.")
@@ -639,6 +837,7 @@ class BayesianRegressor(nn.Module):
             raise ValueError(f"Unsupported activation '{activation}'.")
 
     def forward(self, x: torch.Tensor, sample: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        raw_inputs = x
         total_kl = x.new_zeros(())
 
         for layer in self.layers[:-1]:
@@ -651,10 +850,15 @@ class BayesianRegressor(nn.Module):
         mean = output[:, :1]
         if self.likelihood_std_model == "heteroscedastic":
             predictive_std = F.softplus(output[:, 1:]) + self.min_predictive_std
-        else:
+        elif self.likelihood_std_model == "global":
             if self.global_likelihood_sigma is None:
                 raise RuntimeError("The global likelihood sigma module is not initialized.")
             predictive_std, sigma_prior_penalty = self.global_likelihood_sigma(mean)
+            total_kl = total_kl + sigma_prior_penalty
+        else:
+            if self.spline_likelihood_sigma is None:
+                raise RuntimeError("The spline likelihood sigma module is not initialized.")
+            predictive_std, sigma_prior_penalty = self.spline_likelihood_sigma(raw_inputs)
             total_kl = total_kl + sigma_prior_penalty
         return mean, predictive_std, total_kl
 
@@ -957,6 +1161,7 @@ def evaluate_generated_coverage(
     domain_min: float,
     domain_max: float,
     noise_std: float,
+    observed_interval_noise_stds: Sequence[float] | None,
     num_points: int,
     predictive_samples: int,
     seed: int,
@@ -974,7 +1179,13 @@ def evaluate_generated_coverage(
         generator = torch.Generator().manual_seed(seed)
 
         full_inputs = domain_min + (domain_max - domain_min) * torch.rand((num_points, 1), generator=generator)
-        full_targets = target_fn(full_inputs, noise_std=noise_std)
+        full_targets = sample_targets_with_interval_noise(
+            inputs=full_inputs,
+            target_fn=target_fn,
+            default_noise_std=noise_std,
+            intervals=observed_intervals,
+            interval_noise_stds=observed_interval_noise_stds,
+        )
         full_summary = predict_distribution(
             model=model,
             inputs=scaler.transform_inputs(full_inputs),
@@ -984,7 +1195,13 @@ def evaluate_generated_coverage(
         )
 
         interval_inputs = sample_inputs_from_intervals(observed_intervals, num_points=num_points, generator=generator)
-        interval_targets = target_fn(interval_inputs, noise_std=noise_std)
+        interval_targets = sample_targets_with_interval_noise(
+            inputs=interval_inputs,
+            target_fn=target_fn,
+            default_noise_std=noise_std,
+            intervals=observed_intervals,
+            interval_noise_stds=observed_interval_noise_stds,
+        )
         interval_summary = predict_distribution(
             model=model,
             inputs=scaler.transform_inputs(interval_inputs),
@@ -1024,6 +1241,10 @@ def save_checkpoint(
     global_likelihood_prior_mean_std_original_units: float | None,
     global_likelihood_prior_mean_source: str | None,
     global_likelihood_prior_sigma: float,
+    spline_knots: Sequence[float] | None,
+    spline_knots_original_units: Sequence[float] | None,
+    spline_knot_source: str | None,
+    spline_coefficient_prior_sigma: float | None,
     train_inputs: torch.Tensor,
     train_targets: torch.Tensor,
     observed_inputs: torch.Tensor | None,
@@ -1033,6 +1254,7 @@ def save_checkpoint(
     guide_points_outside_intervals: int,
     guide_points_interior_gaps: int,
     guide_region_mode: str,
+    observed_interval_noise_stds: Sequence[float] | None,
     hidden_dims: Sequence[int],
     activation: str,
     observed_intervals: Sequence[Interval],
@@ -1067,6 +1289,10 @@ def save_checkpoint(
         "global_likelihood_std_original_units": None
         if model.current_global_likelihood_std() is None
         else to_original_target_std(model.current_global_likelihood_std(), scaler),
+        "spline_knots": None if spline_knots is None else list(spline_knots),
+        "spline_knots_original_units": None if spline_knots_original_units is None else list(spline_knots_original_units),
+        "spline_knot_source": spline_knot_source,
+        "spline_coefficient_prior_sigma": spline_coefficient_prior_sigma,
         "train_inputs": train_inputs.detach().cpu(),
         "train_targets": train_targets.detach().cpu(),
         "observed_inputs": None if observed_inputs is None else observed_inputs.detach().cpu(),
@@ -1076,6 +1302,7 @@ def save_checkpoint(
         "guide_points_outside_intervals": guide_points_outside_intervals,
         "guide_points_interior_gaps": guide_points_interior_gaps,
         "guide_region_mode": guide_region_mode,
+        "observed_interval_noise_stds": None if observed_interval_noise_stds is None else list(observed_interval_noise_stds),
         "hidden_dims": list(hidden_dims),
         "activation": activation,
         "observed_intervals": list(observed_intervals),
@@ -1262,6 +1489,14 @@ def plot_from_checkpoint(args: argparse.Namespace) -> None:
     global_likelihood_prior_mean_std = checkpoint.get("global_likelihood_prior_mean_std")
     if global_likelihood_prior_mean_std is None:
         global_likelihood_prior_mean_std = float(global_likelihood_init_std)
+    spline_knots = checkpoint.get("spline_knots")
+    if spline_knots is None:
+        spline_knots_original_units = checkpoint.get("spline_knots_original_units")
+        if spline_knots_original_units is not None:
+            spline_knots = normalize_input_locations(spline_knots_original_units, scaler)
+    spline_coefficient_prior_sigma = float(checkpoint.get("spline_coefficient_prior_sigma", 1.0))
+    if likelihood_std_model == "spline" and spline_knots is None:
+        raise ValueError("This spline checkpoint is missing saved spline-knot metadata.")
 
     model = BayesianRegressor(
         hidden_dims=checkpoint["hidden_dims"],
@@ -1271,6 +1506,8 @@ def plot_from_checkpoint(args: argparse.Namespace) -> None:
         global_likelihood_init_std=float(global_likelihood_init_std),
         global_likelihood_prior_mean_std=float(global_likelihood_prior_mean_std),
         global_likelihood_prior_sigma=float(checkpoint.get("global_likelihood_prior_sigma", 1.0)),
+        spline_knots=None if spline_knots is None else [float(knot) for knot in spline_knots],
+        spline_coefficient_prior_sigma=spline_coefficient_prior_sigma,
         min_predictive_std=float(checkpoint["min_predictive_std"]),
     ).to(device)
     model.load_state_dict(checkpoint["state_dict"])
@@ -1313,12 +1550,16 @@ def plot_from_checkpoint(args: argparse.Namespace) -> None:
     guide_points_outside_intervals = int(checkpoint.get("guide_points_outside_intervals", 0))
     guide_points_interior_gaps = int(checkpoint.get("guide_points_interior_gaps", 0))
     guide_region_mode = str(checkpoint.get("guide_region_mode", "all-gaps"))
+    observed_interval_noise_stds = checkpoint.get("observed_interval_noise_stds")
     if guide_points_outside_intervals > 0 or guide_points_interior_gaps > 0:
         print(
             "Guide observations outside intervals: "
             f"{guide_points_outside_intervals} ({guide_region_mode}), "
             f"interior-gap guide points: {guide_points_interior_gaps}"
         )
+    if observed_interval_noise_stds is not None:
+        noise_values = ", ".join(f"{float(value):.4f}" for value in observed_interval_noise_stds)
+        print(f"Observed-interval noise stds: {noise_values}")
     learned_global_std = model.current_global_likelihood_std()
     if learned_global_std is not None:
         learned_global_std_original = float(
@@ -1329,6 +1570,12 @@ def plot_from_checkpoint(args: argparse.Namespace) -> None:
             f"{learned_global_std:.4f} normalized, "
             f"{learned_global_std_original:.4f} target units"
         )
+    if likelihood_std_model == "spline":
+        spline_knots_original_units = checkpoint.get("spline_knots_original_units")
+        if spline_knots_original_units is not None:
+            knot_values = ", ".join(f"{float(knot):.3f}" for knot in spline_knots_original_units)
+            print(f"Spline likelihood knots: {knot_values}")
+        print(f"Spline coefficient prior sigma: {spline_coefficient_prior_sigma:.4f}")
     print("Uncertainty summary:")
     for line in summarize_region_uncertainty(
         grid_inputs=grid_inputs,
@@ -1350,6 +1597,9 @@ def plot_from_checkpoint(args: argparse.Namespace) -> None:
             domain_min=domain_min,
             domain_max=domain_max,
             noise_std=float(checkpoint.get("noise_std", 0.02)),
+            observed_interval_noise_stds=None
+            if observed_interval_noise_stds is None
+            else [float(value) for value in observed_interval_noise_stds],
             num_points=args.coverage_eval_points,
             predictive_samples=args.coverage_eval_samples,
             seed=args.coverage_eval_seed,
@@ -1401,27 +1651,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-samples", type=int, default=3, help="Weight samples per training batch.")
     parser.add_argument(
         "--likelihood-std-model",
-        choices=["heteroscedastic", "global"],
+        choices=["heteroscedastic", "global", "spline"],
         default="global",
-        help="Use an x-dependent predicted sigma or a single learned global sigma.",
+        help="Use an x-dependent predicted sigma, a single learned global sigma, or a spline model for log(sigma(x)).",
     )
     parser.add_argument(
         "--global-likelihood-init-std",
         type=float,
         default=None,
-        help="Initial value of the learned global likelihood sigma in original target units. Defaults to a data-driven estimate from training observations.",
+        help="Initial value of the learned global sigma, or the spline intercept sigma, in original target units. Defaults to a data-driven estimate from training observations.",
     )
     parser.add_argument(
         "--global-likelihood-prior-mean-std",
         type=float,
         default=None,
-        help="Prior mean of the learned global likelihood sigma in original target units. Defaults to the resolved init value.",
+        help="Prior mean of the learned global sigma, or the spline intercept sigma, in original target units. Defaults to the resolved init value.",
     )
     parser.add_argument(
         "--global-likelihood-prior-sigma",
         type=float,
         default=1.0,
-        help="Standard deviation of the Gaussian prior on log(sigma) for the global likelihood option.",
+        help="Standard deviation of the Gaussian prior on log(sigma) for the global likelihood option and the spline intercept.",
+    )
+    parser.add_argument(
+        "--spline-knots",
+        type=parse_float_list,
+        default=None,
+        help="Optional comma-separated knot locations in original x units for the spline likelihood sigma model.",
+    )
+    parser.add_argument(
+        "--spline-num-knots",
+        type=int,
+        default=5,
+        help="Number of evenly spaced total knots used by the spline likelihood model when --spline-knots is omitted.",
+    )
+    parser.add_argument(
+        "--spline-coefficient-prior-sigma",
+        type=float,
+        default=1.0,
+        help="Standard deviation of the independent zero-mean Gaussian priors on the spline log-sigma coefficients.",
     )
     parser.add_argument(
         "--validation-samples",
@@ -1456,6 +1724,12 @@ def parse_args() -> argparse.Namespace:
         help="Minimum validation predictive NLL improvement required to reset early stopping patience.",
     )
     parser.add_argument("--noise-std", type=float, default=0.02, help="Noise scale used to generate observations.")
+    parser.add_argument(
+        "--observed-interval-noise-stds",
+        type=parse_float_list,
+        default=None,
+        help="Optional comma-separated noise standard deviations, one per observed interval, used only when generating observations inside those intervals.",
+    )
     parser.add_argument(
         "--min-predictive-std",
         type=float,
@@ -1590,6 +1864,17 @@ def main() -> None:
         raise ValueError("The global likelihood prior-mean standard deviation must be positive.")
     if args.global_likelihood_prior_sigma <= 0.0:
         raise ValueError("The global likelihood prior sigma must be positive.")
+    if args.spline_num_knots < 2:
+        raise ValueError("The spline likelihood model needs at least two knots.")
+    if args.spline_coefficient_prior_sigma <= 0.0:
+        raise ValueError("The spline coefficient prior sigma must be positive.")
+    if args.noise_std <= 0.0:
+        raise ValueError("The default observation noise standard deviation must be positive.")
+    if args.observed_interval_noise_stds is not None:
+        if len(args.observed_interval_noise_stds) != len(args.observed_intervals):
+            raise ValueError("Provide exactly one observed-interval noise standard deviation per observed interval.")
+        if any(noise_std <= 0.0 for noise_std in args.observed_interval_noise_stds):
+            raise ValueError("All observed-interval noise standard deviations must be positive.")
     if args.guide_points_outside_intervals < 0:
         raise ValueError("The number of guide points outside intervals must be non-negative.")
     if args.guide_points_interior_gaps < 0:
@@ -1609,6 +1894,7 @@ def main() -> None:
         num_points=args.train_points,
         noise_std=args.noise_std,
         target_fn=target_fn,
+        interval_noise_stds=args.observed_interval_noise_stds,
     )
     observed_inputs, observed_targets = raw_dataset.tensors
     raw_train_dataset, raw_validation_dataset = split_tensor_dataset(
@@ -1667,6 +1953,17 @@ def main() -> None:
             default_prior_mean_std_original_units=global_likelihood_init_std_original,
         )
     )
+    spline_knots_original: List[float] | None = None
+    spline_knots_normalized: List[float] | None = None
+    spline_knot_source: str | None = None
+    if args.likelihood_std_model == "spline":
+        spline_knots_original, spline_knot_source = resolve_spline_knots_original(
+            domain_min=args.domain_min,
+            domain_max=args.domain_max,
+            user_knots_original_units=args.spline_knots,
+            num_knots=args.spline_num_knots,
+        )
+        spline_knots_normalized = normalize_input_locations(spline_knots_original, scaler)
     train_dataset = TensorDataset(scaler.transform_inputs(train_inputs), scaler.transform_targets(train_targets))
     validation_dataset = TensorDataset(
         scaler.transform_inputs(validation_inputs),
@@ -1683,6 +1980,8 @@ def main() -> None:
         global_likelihood_init_std=global_likelihood_init_std,
         global_likelihood_prior_mean_std=global_likelihood_prior_mean_std,
         global_likelihood_prior_sigma=args.global_likelihood_prior_sigma,
+        spline_knots=spline_knots_normalized,
+        spline_coefficient_prior_sigma=args.spline_coefficient_prior_sigma,
         min_predictive_std=args.min_predictive_std,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -1701,9 +2000,15 @@ def main() -> None:
             f"{args.guide_points_outside_intervals} ({args.guide_region_mode}), "
             f"interior-gap guide points: {args.guide_points_interior_gaps}"
         )
-    if args.likelihood_std_model == "global":
+    if args.observed_interval_noise_stds is not None:
+        noise_values = ", ".join(f"{noise_std:.4f}" for noise_std in args.observed_interval_noise_stds)
         print(
-            "Global likelihood sigma settings: "
+            "Observed-interval noise stds: "
+            f"{noise_values} (default outside intervals: {args.noise_std:.4f})"
+        )
+    if args.likelihood_std_model in {"global", "spline"}:
+        print(
+            "Likelihood sigma baseline settings: "
             f"init {global_likelihood_init_std:.4f} normalized, "
             f"{global_likelihood_init_std_original:.4f} target units "
             f"({global_likelihood_init_source}); "
@@ -1711,6 +2016,15 @@ def main() -> None:
             f"{global_likelihood_prior_mean_std_original:.4f} target units "
             f"({global_likelihood_prior_mean_source}); "
             f"log-sigma prior std {args.global_likelihood_prior_sigma:.4f}"
+        )
+    if args.likelihood_std_model == "spline":
+        if spline_knots_original is None:
+            raise RuntimeError("Spline likelihood knots were not resolved.")
+        knot_values = ", ".join(f"{knot:.3f}" for knot in spline_knots_original)
+        print(
+            "Spline likelihood sigma settings: "
+            f"{len(spline_knots_original)} knots ({spline_knot_source}) at [{knot_values}]; "
+            f"coefficient prior std {args.spline_coefficient_prior_sigma:.4f}"
         )
     print(f"Train / validation points: {len(train_dataset)} / {len(validation_dataset)}")
     print("Early stopping metric: validation predictive NLL")
@@ -1746,6 +2060,10 @@ def main() -> None:
             global_likelihood_prior_mean_std_original_units=global_likelihood_prior_mean_std_original,
             global_likelihood_prior_mean_source=global_likelihood_prior_mean_source,
             global_likelihood_prior_sigma=args.global_likelihood_prior_sigma,
+            spline_knots=spline_knots_normalized,
+            spline_knots_original_units=spline_knots_original,
+            spline_knot_source=spline_knot_source,
+            spline_coefficient_prior_sigma=args.spline_coefficient_prior_sigma if args.likelihood_std_model == "spline" else None,
             train_inputs=train_inputs,
             train_targets=train_targets,
             observed_inputs=observed_inputs,
@@ -1755,6 +2073,7 @@ def main() -> None:
             guide_points_outside_intervals=args.guide_points_outside_intervals,
             guide_points_interior_gaps=args.guide_points_interior_gaps,
             guide_region_mode=args.guide_region_mode,
+            observed_interval_noise_stds=args.observed_interval_noise_stds,
             hidden_dims=args.hidden_dims,
             activation=args.activation,
             observed_intervals=args.observed_intervals,
@@ -1882,6 +2201,7 @@ def main() -> None:
             domain_min=args.domain_min,
             domain_max=args.domain_max,
             noise_std=args.noise_std,
+            observed_interval_noise_stds=args.observed_interval_noise_stds,
             num_points=args.coverage_eval_points,
             predictive_samples=args.coverage_eval_samples,
             seed=args.coverage_eval_seed,
