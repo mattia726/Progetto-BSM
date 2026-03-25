@@ -317,6 +317,14 @@ def save_checkpoint(
     spline_knots_original_units: Sequence[float] | None,
     spline_knot_source: str | None,
     spline_coefficient_prior_sigma: float | None,
+    rbf_centers: Sequence[float] | None,
+    rbf_centers_original_units: Sequence[float] | None,
+    rbf_center_source: str | None,
+    rbf_lengthscale: float | None,
+    rbf_lengthscale_original_units: float | None,
+    rbf_lengthscale_source: str | None,
+    rbf_lengthscale_prior_sigma: float | None,
+    rbf_coefficient_prior_sigma: float | None,
     train_inputs: torch.Tensor,
     train_targets: torch.Tensor,
     observed_inputs: torch.Tensor | None,
@@ -365,6 +373,18 @@ def save_checkpoint(
         "spline_knots_original_units": None if spline_knots_original_units is None else list(spline_knots_original_units),
         "spline_knot_source": spline_knot_source,
         "spline_coefficient_prior_sigma": spline_coefficient_prior_sigma,
+        "rbf_centers": None if rbf_centers is None else list(rbf_centers),
+        "rbf_centers_original_units": None if rbf_centers_original_units is None else list(rbf_centers_original_units),
+        "rbf_center_source": rbf_center_source,
+        "rbf_lengthscale": rbf_lengthscale,
+        "rbf_lengthscale_original_units": rbf_lengthscale_original_units,
+        "rbf_lengthscale_source": rbf_lengthscale_source,
+        "rbf_lengthscale_prior_sigma": rbf_lengthscale_prior_sigma,
+        "rbf_current_lengthscale": model.current_rbf_lengthscale(),
+        "rbf_current_lengthscale_original_units": None
+        if model.current_rbf_lengthscale() is None
+        else model.current_rbf_lengthscale() * float(scaler.input_std.squeeze().item()),
+        "rbf_coefficient_prior_sigma": rbf_coefficient_prior_sigma,
         "train_inputs": train_inputs.detach().cpu(),
         "train_targets": train_targets.detach().cpu(),
         "observed_inputs": None if observed_inputs is None else observed_inputs.detach().cpu(),
@@ -541,9 +561,32 @@ def plot_from_checkpoint(args: argparse.Namespace) -> None:
         spline_knots_original_units = checkpoint.get("spline_knots_original_units")
         if spline_knots_original_units is not None:
             spline_knots = normalize_input_locations(spline_knots_original_units, scaler)
-    spline_coefficient_prior_sigma = float(checkpoint.get("spline_coefficient_prior_sigma", 1.0))
+    spline_coefficient_prior_sigma = checkpoint.get("spline_coefficient_prior_sigma")
+    if spline_coefficient_prior_sigma is None:
+        spline_coefficient_prior_sigma = 1.0
+    spline_coefficient_prior_sigma = float(spline_coefficient_prior_sigma)
+    rbf_centers = checkpoint.get("rbf_centers")
+    if rbf_centers is None:
+        rbf_centers_original_units = checkpoint.get("rbf_centers_original_units")
+        if rbf_centers_original_units is not None:
+            rbf_centers = normalize_input_locations(rbf_centers_original_units, scaler)
+    rbf_lengthscale = checkpoint.get("rbf_lengthscale")
+    if rbf_lengthscale is None:
+        rbf_lengthscale_original_units = checkpoint.get("rbf_lengthscale_original_units")
+        if rbf_lengthscale_original_units is not None:
+            rbf_lengthscale = float(rbf_lengthscale_original_units) / float(scaler.input_std.squeeze().item())
+    rbf_lengthscale_prior_sigma = checkpoint.get("rbf_lengthscale_prior_sigma")
+    if rbf_lengthscale_prior_sigma is None:
+        rbf_lengthscale_prior_sigma = 1.0
+    rbf_lengthscale_prior_sigma = float(rbf_lengthscale_prior_sigma)
+    rbf_coefficient_prior_sigma = checkpoint.get("rbf_coefficient_prior_sigma")
+    if rbf_coefficient_prior_sigma is None:
+        rbf_coefficient_prior_sigma = 1.0
+    rbf_coefficient_prior_sigma = float(rbf_coefficient_prior_sigma)
     if likelihood_std_model == "spline" and spline_knots is None:
         raise ValueError("This spline checkpoint is missing saved spline-knot metadata.")
+    if likelihood_std_model == "rbf" and (rbf_centers is None or rbf_lengthscale is None):
+        raise ValueError("This RBF checkpoint is missing saved RBF metadata.")
 
     model = BayesianRegressor(
         hidden_dims=checkpoint["hidden_dims"],
@@ -555,6 +598,10 @@ def plot_from_checkpoint(args: argparse.Namespace) -> None:
         global_likelihood_prior_sigma=float(checkpoint.get("global_likelihood_prior_sigma", 1.0)),
         spline_knots=None if spline_knots is None else [float(knot) for knot in spline_knots],
         spline_coefficient_prior_sigma=spline_coefficient_prior_sigma,
+        rbf_centers=None if rbf_centers is None else [float(center) for center in rbf_centers],
+        rbf_lengthscale=1.0 if rbf_lengthscale is None else float(rbf_lengthscale),
+        rbf_lengthscale_prior_sigma=rbf_lengthscale_prior_sigma,
+        rbf_coefficient_prior_sigma=rbf_coefficient_prior_sigma,
         min_predictive_std=float(checkpoint["min_predictive_std"]),
     ).to(device)
     model.load_state_dict(checkpoint["state_dict"])
@@ -623,6 +670,26 @@ def plot_from_checkpoint(args: argparse.Namespace) -> None:
             knot_values = ", ".join(f"{float(knot):.3f}" for knot in spline_knots_original_units)
             print(f"Spline likelihood knots: {knot_values}")
         print(f"Spline coefficient prior sigma: {spline_coefficient_prior_sigma:.4f}")
+    if likelihood_std_model == "rbf":
+        rbf_centers_original_units = checkpoint.get("rbf_centers_original_units")
+        if rbf_centers_original_units is not None:
+            center_values = ", ".join(f"{float(center):.3f}" for center in rbf_centers_original_units)
+            print(f"RBF likelihood centers: {center_values}")
+        rbf_lengthscale_original_units = checkpoint.get("rbf_lengthscale_original_units")
+        if rbf_lengthscale_original_units is not None:
+            print(
+                "RBF likelihood lengthscale: "
+                f"init/prior-mean {float(rbf_lengthscale_original_units):.4f}, "
+                f"prior sigma on log-lengthscale {rbf_lengthscale_prior_sigma:.4f}"
+            )
+        learned_rbf_lengthscale_original = checkpoint.get("rbf_current_lengthscale_original_units")
+        if learned_rbf_lengthscale_original is None:
+            learned_rbf_lengthscale = model.current_rbf_lengthscale()
+            if learned_rbf_lengthscale is not None:
+                learned_rbf_lengthscale_original = learned_rbf_lengthscale * float(scaler.input_std.squeeze().item())
+        if learned_rbf_lengthscale_original is not None:
+            print(f"Learned RBF lengthscale: {float(learned_rbf_lengthscale_original):.4f}")
+        print(f"RBF coefficient prior sigma: {rbf_coefficient_prior_sigma:.4f}")
     print("Uncertainty summary:")
     for line in summarize_region_uncertainty(
         grid_inputs=grid_inputs,

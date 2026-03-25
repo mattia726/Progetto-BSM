@@ -117,6 +117,12 @@ Example with a natural cubic spline model for `log sigma(x)`:
 python bnn_regression.py --preset paper-figure5 --likelihood-std-model spline --spline-num-knots 5 --plot-path checkpoints/bnn_regression_paper_spline_sigma.png
 ```
 
+Example with a Gaussian radial-basis expansion for `log sigma(x)`:
+
+```bash
+python bnn_regression.py --preset paper-figure5 --likelihood-std-model rbf --rbf-num-centers 5 --plot-path checkpoints/bnn_regression_paper_rbf_sigma.png
+```
+
 Example with a few guide observations outside the main intervals:
 
 ```bash
@@ -166,12 +172,17 @@ Useful regression options:
 - `--likelihood-std-model global` is the default
 - `--likelihood-std-model heteroscedastic`
 - `--likelihood-std-model spline`
+- `--likelihood-std-model rbf`
 - `--global-likelihood-init-std 0.02` is interpreted in original target units; if omitted, the global sigma init is estimated from nearby training-target differences
 - `--global-likelihood-prior-mean-std 0.02` sets the prior mean of the global sigma in original target units; if omitted, it defaults to the resolved init value
 - `--global-likelihood-prior-sigma 1.0`
 - `--spline-num-knots 5` uses evenly spaced total knots across the domain when the spline sigma model is selected
 - `--spline-knots=-0.4,0.0,0.4,0.8,1.2` sets explicit knot locations in original x units for the spline sigma model
 - `--spline-coefficient-prior-sigma 1.0` controls the independent zero-mean Gaussian priors on the spline log-sigma coefficients
+- `--rbf-num-centers 5` uses equally spaced Gaussian RBF centers across the domain when the RBF sigma model is selected
+- `--rbf-lengthscale 0.2` sets the initial and prior-mean Gaussian RBF lengthscale in original x units; if omitted, it defaults to the average center spacing
+- `--rbf-lengthscale-prior-sigma 1.0` controls the Gaussian prior on log RBF lengthscale
+- `--rbf-coefficient-prior-sigma 1.0` controls the independent zero-mean Gaussian priors on the RBF log-sigma coefficients
 - `--coverage-eval-points 500`
 - `--coverage-eval-samples 1000`
 - `--prior normal`
@@ -200,4 +211,5 @@ Training note:
 - early stopping uses validation predictive NLL
 - the KL term is always included as `kl / dataset_size` during training
 - for `--likelihood-std-model spline`, `log sigma(x)` is modeled as an intercept plus a natural cubic spline basis on normalized inputs, and each spline coefficient has its own independent Gaussian prior penalty
+- for `--likelihood-std-model rbf`, `log sigma(x)` is modeled as an intercept plus Gaussian radial basis functions centered at equally spaced points; the RBF lengthscale is learned with a Gaussian prior on log-lengthscale, and each RBF coefficient has its own independent Gaussian prior penalty
 - after training, the script restores the best validation checkpoint and saves it to `checkpoints/bnn_regression_best.pt` by default so it can be reused for inference or plotting

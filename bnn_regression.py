@@ -25,6 +25,8 @@ from bnn_regression_data import (
     resolve_spline_knots_original,
     normalize_input_locations,
     RegressionStandardizer,
+    resolve_rbf_centers_original,
+    resolve_rbf_lengthscale_original,
     set_seed,
     split_tensor_dataset,
     to_original_target_std,
@@ -70,9 +72,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-samples", type=int, default=3, help="Weight samples per training batch.")
     parser.add_argument(
         "--likelihood-std-model",
-        choices=["heteroscedastic", "global", "spline"],
+        choices=["heteroscedastic", "global", "spline", "rbf"],
         default="global",
-        help="Use an x-dependent predicted sigma, a single learned global sigma, or a spline model for log(sigma(x)).",
+        help="Use an x-dependent predicted sigma, a single learned global sigma, a spline model, or an RBF expansion for log(sigma(x)).",
     )
     parser.add_argument(
         "--global-likelihood-init-std",
@@ -109,6 +111,30 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Standard deviation of the independent zero-mean Gaussian priors on the spline log-sigma coefficients.",
+    )
+    parser.add_argument(
+        "--rbf-num-centers",
+        type=int,
+        default=5,
+        help="Number of equally spaced RBF centers used by the RBF likelihood sigma model.",
+    )
+    parser.add_argument(
+        "--rbf-lengthscale",
+        type=float,
+        default=None,
+        help="Optional Gaussian RBF lengthscale in original x units. Defaults to the average spacing between centers.",
+    )
+    parser.add_argument(
+        "--rbf-lengthscale-prior-sigma",
+        type=float,
+        default=1.0,
+        help="Standard deviation of the Gaussian prior on log RBF lengthscale.",
+    )
+    parser.add_argument(
+        "--rbf-coefficient-prior-sigma",
+        type=float,
+        default=1.0,
+        help="Standard deviation of the independent zero-mean Gaussian priors on the RBF log-sigma coefficients.",
     )
     parser.add_argument(
         "--validation-samples",
@@ -287,6 +313,14 @@ def main() -> None:
         raise ValueError("The spline likelihood model needs at least two knots.")
     if args.spline_coefficient_prior_sigma <= 0.0:
         raise ValueError("The spline coefficient prior sigma must be positive.")
+    if args.rbf_num_centers <= 0:
+        raise ValueError("The RBF likelihood model needs at least one center.")
+    if args.rbf_lengthscale is not None and args.rbf_lengthscale <= 0.0:
+        raise ValueError("The RBF lengthscale must be positive.")
+    if args.rbf_lengthscale_prior_sigma <= 0.0:
+        raise ValueError("The RBF lengthscale prior sigma must be positive.")
+    if args.rbf_coefficient_prior_sigma <= 0.0:
+        raise ValueError("The RBF coefficient prior sigma must be positive.")
     if args.noise_std <= 0.0:
         raise ValueError("The default observation noise standard deviation must be positive.")
     if args.observed_interval_noise_stds is not None:
@@ -375,6 +409,12 @@ def main() -> None:
     spline_knots_original = None
     spline_knots_normalized = None
     spline_knot_source = None
+    rbf_centers_original = None
+    rbf_centers_normalized = None
+    rbf_center_source = None
+    rbf_lengthscale_original = None
+    rbf_lengthscale_normalized = None
+    rbf_lengthscale_source = None
     if args.likelihood_std_model == "spline":
         spline_knots_original, spline_knot_source = resolve_spline_knots_original(
             domain_min=args.domain_min,
@@ -383,6 +423,19 @@ def main() -> None:
             num_knots=args.spline_num_knots,
         )
         spline_knots_normalized = normalize_input_locations(spline_knots_original, scaler)
+    if args.likelihood_std_model == "rbf":
+        rbf_centers_original = resolve_rbf_centers_original(
+            domain_min=args.domain_min,
+            domain_max=args.domain_max,
+            num_centers=args.rbf_num_centers,
+        )
+        rbf_center_source = "uniform"
+        rbf_centers_normalized = normalize_input_locations(rbf_centers_original, scaler)
+        rbf_lengthscale_original, rbf_lengthscale_source = resolve_rbf_lengthscale_original(
+            centers_original_units=rbf_centers_original,
+            user_lengthscale_original_units=args.rbf_lengthscale,
+        )
+        rbf_lengthscale_normalized = rbf_lengthscale_original / float(scaler.input_std.squeeze().item())
     train_dataset = TensorDataset(scaler.transform_inputs(train_inputs), scaler.transform_targets(train_targets))
     validation_dataset = TensorDataset(
         scaler.transform_inputs(validation_inputs),
@@ -401,6 +454,10 @@ def main() -> None:
         global_likelihood_prior_sigma=args.global_likelihood_prior_sigma,
         spline_knots=spline_knots_normalized,
         spline_coefficient_prior_sigma=args.spline_coefficient_prior_sigma,
+        rbf_centers=rbf_centers_normalized,
+        rbf_lengthscale=1.0 if rbf_lengthscale_normalized is None else rbf_lengthscale_normalized,
+        rbf_lengthscale_prior_sigma=args.rbf_lengthscale_prior_sigma,
+        rbf_coefficient_prior_sigma=args.rbf_coefficient_prior_sigma,
         min_predictive_std=args.min_predictive_std,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -425,7 +482,7 @@ def main() -> None:
             "Observed-interval noise stds: "
             f"{noise_values} (default outside intervals: {args.noise_std:.4f})"
         )
-    if args.likelihood_std_model in {"global", "spline"}:
+    if args.likelihood_std_model in {"global", "spline", "rbf"}:
         print(
             "Likelihood sigma baseline settings: "
             f"init {global_likelihood_init_std:.4f} normalized, "
@@ -444,6 +501,17 @@ def main() -> None:
             "Spline likelihood sigma settings: "
             f"{len(spline_knots_original)} knots ({spline_knot_source}) at [{knot_values}]; "
             f"coefficient prior std {args.spline_coefficient_prior_sigma:.4f}"
+        )
+    if args.likelihood_std_model == "rbf":
+        if rbf_centers_original is None or rbf_lengthscale_original is None:
+            raise RuntimeError("RBF likelihood centers or lengthscale were not resolved.")
+        center_values = ", ".join(f"{center:.3f}" for center in rbf_centers_original)
+        print(
+            "RBF likelihood sigma settings: "
+            f"{len(rbf_centers_original)} centers ({rbf_center_source}) at [{center_values}]; "
+            f"lengthscale {rbf_lengthscale_original:.4f} ({rbf_lengthscale_source}); "
+            f"log-lengthscale prior std {args.rbf_lengthscale_prior_sigma:.4f}; "
+            f"coefficient prior std {args.rbf_coefficient_prior_sigma:.4f}"
         )
     print(f"Train / validation points: {len(train_dataset)} / {len(validation_dataset)}")
     print("Early stopping metric: validation predictive NLL")
@@ -483,6 +551,14 @@ def main() -> None:
             spline_knots_original_units=spline_knots_original,
             spline_knot_source=spline_knot_source,
             spline_coefficient_prior_sigma=args.spline_coefficient_prior_sigma if args.likelihood_std_model == "spline" else None,
+            rbf_centers=rbf_centers_normalized,
+            rbf_centers_original_units=rbf_centers_original,
+            rbf_center_source=rbf_center_source,
+            rbf_lengthscale=rbf_lengthscale_normalized,
+            rbf_lengthscale_original_units=rbf_lengthscale_original,
+            rbf_lengthscale_source=rbf_lengthscale_source,
+            rbf_lengthscale_prior_sigma=args.rbf_lengthscale_prior_sigma if args.likelihood_std_model == "rbf" else None,
+            rbf_coefficient_prior_sigma=args.rbf_coefficient_prior_sigma if args.likelihood_std_model == "rbf" else None,
             train_inputs=train_inputs,
             train_targets=train_targets,
             observed_inputs=observed_inputs,

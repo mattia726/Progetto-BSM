@@ -55,6 +55,26 @@ def natural_cubic_spline_basis(x: torch.Tensor, knots: torch.Tensor) -> torch.Te
     return torch.cat(basis_terms, dim=1)
 
 
+def gaussian_rbf_basis(x: torch.Tensor, centers: torch.Tensor, lengthscale: torch.Tensor) -> torch.Tensor:
+    """Return Gaussian radial basis functions evaluated at one-dimensional inputs."""
+
+    if centers.ndim != 1:
+        raise ValueError("RBF centers must be a one-dimensional tensor.")
+    if centers.numel() < 1:
+        raise ValueError("At least one RBF center is required.")
+    if torch.any(centers[1:] <= centers[:-1]):
+        raise ValueError("RBF centers must be strictly increasing.")
+
+    flat_x = x.reshape(-1, 1)
+    centers = centers.to(device=flat_x.device, dtype=flat_x.dtype).reshape(1, -1)
+    lengthscale = lengthscale.to(device=flat_x.device, dtype=flat_x.dtype)
+    if torch.any(lengthscale <= 0):
+        raise ValueError("The RBF lengthscale must be positive.")
+
+    scaled_distance = (flat_x - centers) / lengthscale
+    return torch.exp(-0.5 * scaled_distance.pow(2))
+
+
 class PriorDistribution:
     """Interface for priors used by Bayesian layers."""
 
@@ -250,6 +270,74 @@ class SplineLikelihoodSigma(nn.Module):
         return sigma, prior_penalty
 
 
+class RBFLikelihoodSigma(nn.Module):
+    """Gaussian RBF model for log(sigma(x)) with independent coefficient priors."""
+
+    def __init__(
+        self,
+        init_std: float,
+        prior_mean_std: float,
+        prior_sigma: float,
+        centers: Sequence[float],
+        lengthscale: float,
+        lengthscale_prior_sigma: float,
+        coefficient_prior_sigma: float,
+    ) -> None:
+        super().__init__()
+
+        if init_std <= 0.0:
+            raise ValueError("The RBF likelihood initial standard deviation must be positive.")
+        if prior_mean_std <= 0.0:
+            raise ValueError("The RBF likelihood prior-mean standard deviation must be positive.")
+        if prior_sigma <= 0.0:
+            raise ValueError("The RBF likelihood intercept prior sigma must be positive.")
+        if coefficient_prior_sigma <= 0.0:
+            raise ValueError("The RBF likelihood coefficient prior sigma must be positive.")
+        if lengthscale <= 0.0:
+            raise ValueError("The RBF lengthscale must be positive.")
+        if lengthscale_prior_sigma <= 0.0:
+            raise ValueError("The RBF lengthscale prior sigma must be positive.")
+        if len(centers) < 1:
+            raise ValueError("The RBF likelihood model needs at least one center.")
+
+        center_tensor = torch.tensor(centers, dtype=torch.float32)
+        if center_tensor.numel() > 1 and torch.any(center_tensor[1:] <= center_tensor[:-1]):
+            raise ValueError("RBF centers must be strictly increasing.")
+
+        self.register_buffer("centers", center_tensor)
+        self.log_std_intercept = nn.Parameter(torch.tensor(math.log(init_std), dtype=torch.float32))
+        self.log_lengthscale = nn.Parameter(torch.tensor(math.log(lengthscale), dtype=torch.float32))
+        self.coefficients = nn.Parameter(torch.zeros(center_tensor.numel(), dtype=torch.float32))
+        self.intercept_prior_mean_log_std = math.log(prior_mean_std)
+        self.intercept_prior_sigma = prior_sigma
+        self.lengthscale_prior_mean_log = math.log(lengthscale)
+        self.lengthscale_prior_sigma = lengthscale_prior_sigma
+        self.coefficient_prior_sigma = coefficient_prior_sigma
+
+    def forward(self, reference_x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        flat_x = reference_x.reshape(-1, 1)
+        log_lengthscale = self.log_lengthscale.to(device=flat_x.device, dtype=flat_x.dtype)
+        lengthscale = torch.exp(log_lengthscale)
+        basis = gaussian_rbf_basis(flat_x, self.centers, lengthscale)
+        intercept = self.log_std_intercept.to(device=flat_x.device, dtype=flat_x.dtype)
+        coefficients = self.coefficients.to(device=flat_x.device, dtype=flat_x.dtype)
+        log_std = intercept + basis.matmul(coefficients.unsqueeze(-1))
+        sigma = torch.exp(log_std)
+
+        intercept_prior_mean = flat_x.new_tensor(self.intercept_prior_mean_log_std)
+        intercept_prior_sigma = flat_x.new_tensor(self.intercept_prior_sigma)
+        lengthscale_prior_mean = flat_x.new_tensor(self.lengthscale_prior_mean_log)
+        lengthscale_prior_sigma = flat_x.new_tensor(self.lengthscale_prior_sigma)
+        coefficient_prior_sigma = flat_x.new_tensor(self.coefficient_prior_sigma)
+        prior_penalty = -gaussian_log_prob(intercept, intercept_prior_mean, intercept_prior_sigma)
+        prior_penalty = prior_penalty - gaussian_log_prob(log_lengthscale, lengthscale_prior_mean, lengthscale_prior_sigma)
+        prior_penalty = prior_penalty - gaussian_log_prob(coefficients, 0.0, coefficient_prior_sigma).sum()
+        return sigma, prior_penalty
+
+    def current_lengthscale(self) -> float:
+        return float(torch.exp(self.log_lengthscale.detach()).item())
+
+
 class BayesianRegressor(nn.Module):
     """Small Bayesian MLP that predicts a Gaussian mean and either local or global scale."""
 
@@ -264,6 +352,10 @@ class BayesianRegressor(nn.Module):
         global_likelihood_prior_sigma: float = 1.0,
         spline_knots: Sequence[float] | None = None,
         spline_coefficient_prior_sigma: float = 1.0,
+        rbf_centers: Sequence[float] | None = None,
+        rbf_lengthscale: float = 1.0,
+        rbf_lengthscale_prior_sigma: float = 1.0,
+        rbf_coefficient_prior_sigma: float = 1.0,
         min_predictive_std: float = 1e-3,
     ) -> None:
         super().__init__()
@@ -281,6 +373,7 @@ class BayesianRegressor(nn.Module):
         )
         self.global_likelihood_sigma: GlobalLikelihoodSigma | None = None
         self.spline_likelihood_sigma: SplineLikelihoodSigma | None = None
+        self.rbf_likelihood_sigma: RBFLikelihoodSigma | None = None
         if likelihood_std_model == "global":
             self.global_likelihood_sigma = GlobalLikelihoodSigma(
                 init_std=global_likelihood_init_std,
@@ -296,6 +389,18 @@ class BayesianRegressor(nn.Module):
                 prior_sigma=global_likelihood_prior_sigma,
                 knots=spline_knots,
                 coefficient_prior_sigma=spline_coefficient_prior_sigma,
+            )
+        elif likelihood_std_model == "rbf":
+            if rbf_centers is None:
+                raise ValueError("Provide RBF centers when likelihood_std_model='rbf'.")
+            self.rbf_likelihood_sigma = RBFLikelihoodSigma(
+                init_std=global_likelihood_init_std,
+                prior_mean_std=global_likelihood_prior_mean_std,
+                prior_sigma=global_likelihood_prior_sigma,
+                centers=rbf_centers,
+                lengthscale=rbf_lengthscale,
+                lengthscale_prior_sigma=rbf_lengthscale_prior_sigma,
+                coefficient_prior_sigma=rbf_coefficient_prior_sigma,
             )
         elif likelihood_std_model != "heteroscedastic":
             raise ValueError(f"Unsupported likelihood sigma model '{likelihood_std_model}'.")
@@ -326,10 +431,15 @@ class BayesianRegressor(nn.Module):
                 raise RuntimeError("The global likelihood sigma module is not initialized.")
             predictive_std, sigma_prior_penalty = self.global_likelihood_sigma(mean)
             total_kl = total_kl + sigma_prior_penalty
-        else:
+        elif self.likelihood_std_model == "spline":
             if self.spline_likelihood_sigma is None:
                 raise RuntimeError("The spline likelihood sigma module is not initialized.")
             predictive_std, sigma_prior_penalty = self.spline_likelihood_sigma(raw_inputs)
+            total_kl = total_kl + sigma_prior_penalty
+        else:
+            if self.rbf_likelihood_sigma is None:
+                raise RuntimeError("The RBF likelihood sigma module is not initialized.")
+            predictive_std, sigma_prior_penalty = self.rbf_likelihood_sigma(raw_inputs)
             total_kl = total_kl + sigma_prior_penalty
         return mean, predictive_std, total_kl
 
@@ -337,6 +447,11 @@ class BayesianRegressor(nn.Module):
         if self.global_likelihood_sigma is None:
             return None
         return self.global_likelihood_sigma.current_std()
+
+    def current_rbf_lengthscale(self) -> float | None:
+        if self.rbf_likelihood_sigma is None:
+            return None
+        return self.rbf_likelihood_sigma.current_lengthscale()
 
 
 def gaussian_nll(mean: torch.Tensor, predictive_std: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
