@@ -13,7 +13,10 @@ The model uses variational inference with Bayes by Backprop:
 ## Files
 
 - `bnn_mnist.py`: training and evaluation script
-- `bnn_regression.py`: Bayes-by-Backprop regression on disjoint observation intervals
+- `bnn_regression.py`: CLI entrypoint for Bayes-by-Backprop regression on disjoint observation intervals
+- `bnn_regression_data.py`: interval handling, synthetic targets, dataset builders, and normalization helpers
+- `bnn_regression_model.py`: priors, Bayesian layers, spline/global sigma models, and training utilities
+- `bnn_regression_eval.py`: predictive evaluation, checkpointing, plotting, and checkpoint-only replotting
 - `draw_digit_app.py`: Tkinter app to draw a digit and classify it with the trained BNN
 - `requirements.txt`: minimal dependencies
 
