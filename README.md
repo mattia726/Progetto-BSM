@@ -14,7 +14,9 @@ The model uses variational inference with Bayes by Backprop:
 
 - `bnn_mnist.py`: training and evaluation script
 - `bnn_regression.py`: compatibility launcher for the regression CLI
+- `mc_dropout_regression.py`: compatibility launcher for the MC-dropout regression CLI
 - `regression/bnn_regression.py`: CLI entrypoint for Bayes-by-Backprop regression on disjoint observation intervals
+- `regression/mc_dropout_regression.py`: CLI entrypoint for feedforward regression with Monte Carlo dropout
 - `regression/bnn_regression_data.py`: interval handling, synthetic targets, dataset builders, and normalization helpers
 - `regression/bnn_regression_model.py`: priors, Bayesian layers, spline/global sigma models, and training utilities
 - `regression/bnn_regression_eval.py`: predictive evaluation, checkpointing, plotting, and checkpoint-only replotting
@@ -214,3 +216,38 @@ Training note:
 - for `--likelihood-std-model spline`, `log sigma(x)` is modeled as an intercept plus a natural cubic spline basis on normalized inputs, and each spline coefficient has its own independent Gaussian prior penalty
 - for `--likelihood-std-model rbf`, `log sigma(x)` is modeled as an intercept plus Gaussian radial basis functions centered at equally spaced points; the RBF lengthscale is learned with a Gaussian prior on log-lengthscale, and each RBF coefficient has its own independent Gaussian prior penalty
 - after training, the script restores the best validation checkpoint and saves it to `outputs/regression/weights/bnn_regression_best.pt` by default so it can be reused for inference or plotting
+
+## MC Dropout Regression
+
+`mc_dropout_regression.py` trains a standard feedforward regressor with `nn.Dropout`, optimizes an `MSE` loss, and keeps dropout active at test time to draw multiple predictive samples with different masks. Those samples are then used to build pointwise interquartile and 95% confidence bands.
+
+Example with the default oscillatory target:
+
+```bash
+python mc_dropout_regression.py --epochs 500 --plot-path outputs/regression/plots/mc_dropout_regression.png
+```
+
+Example with the paper preset and shaded observed intervals:
+
+```bash
+python mc_dropout_regression.py --preset paper-figure5 --dropout-rate 0.15 --shade-observed-intervals --plot-path outputs/regression/plots/mc_dropout_regression_paper.png
+```
+
+Useful MC-dropout options:
+
+- `--hidden-dims 256,256,256`
+- `--activation relu`
+- `--dropout-rate 0.1`
+- `--validation-samples 64`
+- `--test-samples 400`
+- `--plot-quantiles function`
+- `--guide-points-outside-intervals 6`
+- `--guide-points-interior-gaps 2`
+
+The saved figure follows the same layout as the Bayesian regression plot:
+
+- black `x` markers for observed training points
+- a dashed gray reference curve for the synthetic target
+- a red predictive median
+- a dark-blue interquartile band
+- a light-blue 95% band estimated from MC-dropout samples

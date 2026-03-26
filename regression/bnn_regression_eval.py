@@ -429,6 +429,11 @@ def plot_predictions(
     quantile_space: str = "function",
     shade_observed_intervals: bool = False,
     show_summary_box: bool = True,
+    title: str = "Bayesian Regression with Disjoint Observation Intervals",
+    side_panel_lines: Sequence[str] | None = None,
+    coverage_inputs: torch.Tensor | None = None,
+    coverage_targets: torch.Tensor | None = None,
+    coverage_inside_95: torch.Tensor | None = None,
 ) -> None:
     """Save a plot with observed data, predictive median, IQR, and a 95% interval."""
 
@@ -457,32 +462,65 @@ def plot_predictions(
     q75 = summary[q75_key].cpu().numpy()
     q025 = summary[q025_key].cpu().numpy()
     q975 = summary[q975_key].cpu().numpy()
-    iqr_width = q75 - q25
-    interval95_width = q975 - q025
 
     grid_inputs_cpu = grid_inputs.squeeze(-1).cpu()
     observed_mask = torch.zeros_like(grid_inputs_cpu, dtype=torch.bool)
     for left, right in observed_intervals:
         observed_mask |= interval_mask(grid_inputs_cpu, left, right)
-    missing_mask = ~observed_mask
 
-    observed_mask_np = observed_mask.numpy()
-    missing_mask_np = missing_mask.numpy()
+    figure = plt.figure(figsize=(12, 5))
+    grid_spec = figure.add_gridspec(1, 2, width_ratios=[1.35, 4.65], wspace=0.02)
+    side_panel = figure.add_subplot(grid_spec[0, 0])
+    axis = figure.add_subplot(grid_spec[0, 1])
+    side_panel.axis("off")
 
-    observed_iqr_mean = float(iqr_width[observed_mask_np].mean()) if observed_mask.any().item() else float("nan")
-    missing_iqr_mean = float(iqr_width[missing_mask_np].mean()) if missing_mask.any().item() else float("nan")
-    observed_interval95_mean = (
-        float(interval95_width[observed_mask_np].mean()) if observed_mask.any().item() else float("nan")
-    )
-    missing_interval95_mean = (
-        float(interval95_width[missing_mask_np].mean()) if missing_mask.any().item() else float("nan")
-    )
-
-    figure, axis = plt.subplots(figsize=(10, 5))
+    true_function = reference_curve.squeeze(-1).cpu()
+    function_q025 = summary["function_q025"].cpu()
+    function_q975 = summary["function_q975"].cpu()
+    true_function_in_95 = (true_function >= function_q025) & (true_function <= function_q975)
+    coverage_segments: list[tuple[float, float]] = []
+    segment_start = None
+    for index, is_covered in enumerate(true_function_in_95.tolist()):
+        if is_covered and segment_start is None:
+            segment_start = index
+        elif (not is_covered) and segment_start is not None:
+            coverage_segments.append((float(x_grid[segment_start]), float(x_grid[index - 1])))
+            segment_start = None
+    if segment_start is not None:
+        coverage_segments.append((float(x_grid[segment_start]), float(x_grid[-1])))
 
     if shade_observed_intervals:
         for left, right in observed_intervals:
             axis.axvspan(left, right, color="#d8f0d2", alpha=0.35, linewidth=0)
+
+    if coverage_inputs is not None and coverage_targets is not None and coverage_inside_95 is not None:
+        x_coverage = coverage_inputs.squeeze(-1).cpu().numpy()
+        y_coverage = coverage_targets.squeeze(-1).cpu().numpy()
+        covered_mask = coverage_inside_95.cpu().numpy().astype(bool)
+        if covered_mask.any():
+            axis.scatter(
+                x_coverage[covered_mask],
+                y_coverage[covered_mask],
+                color="#2ca25f",
+                marker="o",
+                s=12,
+                alpha=0.30,
+                linewidths=0,
+                zorder=1,
+                label="Generated pts in 95%",
+            )
+        if (~covered_mask).any():
+            axis.scatter(
+                x_coverage[~covered_mask],
+                y_coverage[~covered_mask],
+                color="#d94841",
+                marker="o",
+                s=16,
+                alpha=0.65,
+                linewidths=0,
+                zorder=2,
+                label="Generated pts out 95%",
+            )
 
     if observed_inputs is not None and observed_targets is not None:
         x_observed = observed_inputs.squeeze(-1).cpu().numpy()
@@ -512,29 +550,45 @@ def plot_predictions(
     axis.plot(x_grid, q25, color="#4f8dd6", linewidth=1.0, alpha=0.95, zorder=3)
     axis.plot(x_grid, q75, color="#4f8dd6", linewidth=1.0, alpha=0.95, zorder=3)
     axis.plot(x_grid, median, color="#c0392b", linewidth=2.0, label="Median prediction")
+    for index, (left, right) in enumerate(coverage_segments):
+        axis.axvspan(
+            left,
+            right,
+            ymin=0.0,
+            ymax=0.014,
+            color="#2ca25f",
+            alpha=0.42,
+            linewidth=0,
+            zorder=4,
+            label="Function inside 95% int." if index == 0 else "_nolegend_",
+        )
 
-    axis.set_title("Bayesian Regression with Disjoint Observation Intervals")
+    axis.set_title(title)
     axis.set_xlabel("x")
     axis.set_ylabel("y")
-    if show_summary_box:
-        axis.text(
+    if show_summary_box and side_panel_lines:
+        side_panel.text(
             0.02,
-            0.02,
-            (
-                f"Observed mean IQR: {observed_iqr_mean:.3f}\n"
-                f"Missing mean IQR: {missing_iqr_mean:.3f}\n"
-                f"Observed mean 95% width: {observed_interval95_mean:.3f}\n"
-                f"Missing mean 95% width: {missing_interval95_mean:.3f}"
-            ),
-            transform=axis.transAxes,
+            0.34,
+            "\n".join(side_panel_lines),
+            transform=side_panel.transAxes,
             fontsize=10,
             color="#355c8a",
             bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.75, "edgecolor": "#b8cce6"},
+            va="top",
         )
-    axis.legend()
+    handles, labels = axis.get_legend_handles_labels()
+    side_panel.legend(
+        handles,
+        labels,
+        loc="upper left",
+        bbox_to_anchor=(0.02, 0.98),
+        borderaxespad=0.0,
+        frameon=True,
+    )
     axis.grid(alpha=0.2)
-    figure.tight_layout()
-    figure.savefig(plot_path, dpi=160)
+    figure.subplots_adjust(left=0.03, right=0.99, top=0.92, bottom=0.12, wspace=0.02)
+    figure.savefig(plot_path, dpi=160, bbox_inches="tight")
     plt.close(figure)
 
 
@@ -604,7 +658,15 @@ def plot_from_checkpoint(args: argparse.Namespace) -> None:
         rbf_coefficient_prior_sigma=rbf_coefficient_prior_sigma,
         min_predictive_std=float(checkpoint["min_predictive_std"]),
     ).to(device)
-    model.load_state_dict(checkpoint["state_dict"])
+    state_dict = dict(checkpoint["state_dict"])
+    legacy_rbf_lengthscale_key = "rbf_likelihood_sigma.lengthscale"
+    new_rbf_log_lengthscale_key = "rbf_likelihood_sigma.log_lengthscale"
+    if legacy_rbf_lengthscale_key in state_dict and new_rbf_log_lengthscale_key not in state_dict:
+        legacy_lengthscale = state_dict.pop(legacy_rbf_lengthscale_key)
+        if torch.any(legacy_lengthscale <= 0):
+            raise ValueError("The legacy RBF checkpoint stores a non-positive lengthscale.")
+        state_dict[new_rbf_log_lengthscale_key] = legacy_lengthscale.log()
+    model.load_state_dict(state_dict)
     model.eval()
 
     target_function_name = str(checkpoint.get("target_function", "oscillatory"))
